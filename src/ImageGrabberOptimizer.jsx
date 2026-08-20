@@ -16,32 +16,9 @@ import {
 
 import { removeBackground as aiRemoveBackground } from "@imgly/background-removal";
 
-const MAX_OUTPUT_BYTES = 1024 * 1024;
-const MIN_JPEG_QUALITY = 0.45;
-const MAX_WORK_DIM = 2500;
-const AI_MAX_DIMENSION = 2048;
-
-const AI_CONFIG = {
-	model: "isnet_fp16",
-	device: "gpu",
-	proxyToWorker: false,
-	debug: false,
-	output: {
-		format: "image/png",
-		quality: 1,
-	},
-};
-
-const AI_FALLBACK_CONFIG = {
-	model: "isnet_fp16",
-	device: "cpu",
-	proxyToWorker: false,
-	debug: false,
-	output: {
-		format: "image/png",
-		quality: 1,
-	},
-};
+/* ---------------------------------------------------------------------- */
+/* ZIP HELPERS                                                            */
+/* ---------------------------------------------------------------------- */
 
 const CRC_TABLE = (() => {
 	const table = new Uint32Array(256);
@@ -69,53 +46,49 @@ function crc32(bytes) {
 	return (crc ^ 0xffffffff) >>> 0;
 }
 
-function dosDateTime(date) {
-	const year = Math.max(1980, date.getFullYear());
+function dosDateTime(d) {
+	const date =
+		((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
 
-	const dosDate =
-		((year - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate();
-
-	const dosTime =
-		(date.getHours() << 11) |
-		(date.getMinutes() << 5) |
-		(date.getSeconds() >> 1);
+	const time =
+		(d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
 
 	return {
-		date: dosDate & 0xffff,
-		time: dosTime & 0xffff,
+		date,
+		time,
 	};
 }
 
 function u16(n) {
-	return new Uint8Array([n & 0xff, (n >>> 8) & 0xff]);
+	return new Uint8Array([n & 0xff, (n >> 8) & 0xff]);
 }
 
 function u32(n) {
 	return new Uint8Array([
 		n & 0xff,
-		(n >>> 8) & 0xff,
-		(n >>> 16) & 0xff,
-		(n >>> 24) & 0xff,
+		(n >> 8) & 0xff,
+		(n >> 16) & 0xff,
+		(n >> 24) & 0xff,
 	]);
 }
 
 function concatBytes(chunks) {
-	const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+	const total = chunks.reduce((s, c) => s + c.length, 0);
 
-	const output = new Uint8Array(total);
+	const out = new Uint8Array(total);
 
-	let offset = 0;
+	let off = 0;
 
-	for (const chunk of chunks) {
-		output.set(chunk, offset);
-		offset += chunk.length;
+	for (const c of chunks) {
+		out.set(c, off);
+		off += c.length;
 	}
 
-	return output;
+	return out;
 }
 
-function strBytes(value) {
-	return new TextEncoder().encode(value);
+function strBytes(s) {
+	return new TextEncoder().encode(s);
 }
 
 function buildZip(entries) {
@@ -132,14 +105,12 @@ function buildZip(entries) {
 
 		const crc = crc32(data);
 		const size = data.length;
-		const flags = 0x0800;
-		const compression = 0;
 
-		const localHeader = concatBytes([
+		const local = concatBytes([
 			u32(0x04034b50),
 			u16(20),
-			u16(flags),
-			u16(compression),
+			u16(0),
+			u16(0),
 			u16(time),
 			u16(date),
 			u32(crc),
@@ -148,16 +119,17 @@ function buildZip(entries) {
 			u16(nameBytes.length),
 			u16(0),
 			nameBytes,
+			data,
 		]);
 
-		localChunks.push(concatBytes([localHeader, data]));
+		localChunks.push(local);
 
-		const centralHeader = concatBytes([
+		const central = concatBytes([
 			u32(0x02014b50),
 			u16(20),
 			u16(20),
-			u16(flags),
-			u16(compression),
+			u16(0),
+			u16(0),
 			u16(time),
 			u16(date),
 			u32(crc),
@@ -173,26 +145,30 @@ function buildZip(entries) {
 			nameBytes,
 		]);
 
-		centralChunks.push(centralHeader);
+		centralChunks.push(central);
 
-		offset += localHeader.length + data.length;
+		offset += local.length;
 	}
 
-	const centralDirectory = concatBytes(centralChunks);
+	const centralDir = concatBytes(centralChunks);
 
-	const endOfCentralDirectory = concatBytes([
+	const end = concatBytes([
 		u32(0x06054b50),
 		u16(0),
 		u16(0),
 		u16(entries.length),
 		u16(entries.length),
-		u32(centralDirectory.length),
+		u32(centralDir.length),
 		u32(offset),
 		u16(0),
 	]);
 
-	return concatBytes([...localChunks, centralDirectory, endOfCentralDirectory]);
+	return concatBytes([...localChunks, centralDir, end]);
 }
+
+/* ---------------------------------------------------------------------- */
+/* HELPERS                                                                */
+/* ---------------------------------------------------------------------- */
 
 function formatBytes(bytes) {
 	if (bytes == null) {
@@ -212,6 +188,7 @@ function formatBytes(bytes) {
 
 function stripExt(name) {
 	const i = name.lastIndexOf(".");
+
 	return i > 0 ? name.slice(0, i) : name;
 }
 
@@ -225,9 +202,7 @@ function loadImageEl(src, crossOrigin) {
 
 		img.onload = () => resolve(img);
 
-		img.onerror = () => {
-			reject(new Error("Couldn't load image."));
-		};
+		img.onerror = () => reject(new Error("Couldn't load image."));
 
 		img.src = src;
 	});
@@ -240,10 +215,11 @@ function downloadBlob(blob, filename) {
 
 	a.href = url;
 	a.download = filename;
-	a.style.display = "none";
 
 	document.body.appendChild(a);
+
 	a.click();
+
 	a.remove();
 
 	setTimeout(() => {
@@ -251,93 +227,14 @@ function downloadBlob(blob, filename) {
 	}, 4000);
 }
 
-async function selectDownloadDirectory() {
-	if (
-		typeof window === "undefined" ||
-		typeof window.showDirectoryPicker !== "function"
-	) {
-		return null;
-	}
+/* ---------------------------------------------------------------------- */
+/* BROWSER YIELD                                                         */
+/* ---------------------------------------------------------------------- */
 
-	try {
-		const directoryHandle = await window.showDirectoryPicker({
-			mode: "readwrite",
-		});
-
-		return directoryHandle;
-	} catch (error) {
-		if (error?.name === "AbortError") {
-			return null;
-		}
-
-		console.error("Directory selection failed:", error);
-
-		return null;
-	}
-}
-
-async function verifyDirectoryPermission(directoryHandle) {
-	if (!directoryHandle) {
-		return false;
-	}
-
-	try {
-		if (typeof directoryHandle.queryPermission === "function") {
-			const permission = await directoryHandle.queryPermission({
-				mode: "readwrite",
-			});
-
-			if (permission === "granted") {
-				return true;
-			}
-		}
-
-		if (typeof directoryHandle.requestPermission === "function") {
-			const permission = await directoryHandle.requestPermission({
-				mode: "readwrite",
-			});
-
-			return permission === "granted";
-		}
-
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-async function downloadToDirectory(blob, filename, directoryHandle) {
-	if (!directoryHandle) {
-		throw new Error("No destination directory selected.");
-	}
-
-	const permission = await directoryHandle.queryPermission({
-		mode: "readwrite",
-	});
-
-	if (permission !== "granted") {
-		const requested = await directoryHandle.requestPermission({
-			mode: "readwrite",
-		});
-
-		if (requested !== "granted") {
-			throw new Error("Permission to write to the selected folder was denied.");
-		}
-	}
-
-	const fileHandle = await directoryHandle.getFileHandle(filename, {
-		create: true,
-	});
-
-	const writable = await fileHandle.createWritable();
-
-	try {
-		await writable.write(blob);
-	} finally {
-		await writable.close();
-	}
-}
-
+/*
+ * Allows the browser to repaint and respond to user interaction
+ * between heavy operations.
+ */
 function yieldToBrowser() {
 	return new Promise((resolve) => {
 		if (typeof requestIdleCallback === "function") {
@@ -350,35 +247,133 @@ function yieldToBrowser() {
 	});
 }
 
-function canvasToBlob(canvas, mime, quality) {
-	return new Promise((resolve, reject) => {
-		try {
-			canvas.toBlob(
-				(blob) => {
-					if (blob) {
-						resolve(blob);
-					} else {
-						reject(new Error("Image encoding failed."));
-					}
-				},
-				mime,
-				quality,
-			);
-		} catch (error) {
-			reject(error);
-		}
-	});
+/* ---------------------------------------------------------------------- */
+/* IMAGE LIMITS                                                           */
+/* ---------------------------------------------------------------------- */
+
+/*
+ * Maximum dimensions used for normal image processing.
+ */
+const MAX_WORK_DIM = 2500;
+
+/*
+ * Maximum AI inference dimension.
+ *
+ * Sending a 5000px / 6000px / 8000px image directly to the
+ * segmentation model can consume a huge amount of browser memory.
+ */
+const AI_MAX_DIMENSION = 2048;
+
+/*
+ * Final output target.
+ */
+const MAX_OUTPUT_BYTES = 1024 * 1024;
+
+/*
+ * Minimum JPEG quality.
+ */
+const MIN_JPEG_QUALITY = 0.45;
+
+/* ---------------------------------------------------------------------- */
+/* AI BACKGROUND REMOVAL                                                  */
+/* ---------------------------------------------------------------------- */
+
+let backgroundRemovalReady = false;
+
+/*
+ * We intentionally do NOT call preload().
+ *
+ * The model will be loaded only when the first background-removal
+ * operation actually starts.
+ */
+let backgroundRemovalLoading = null;
+
+/*
+ * Primary configuration.
+ *
+ * WebGPU is used when available.
+ */
+const AI_PRIMARY_CONFIG = {
+	model: "isnet_fp16",
+
+	/*
+	 * Changed dynamically if WebGPU isn't supported.
+	 */
+	device: "gpu",
+
+	/*
+	 * Let the library use a worker where supported.
+	 */
+	proxyToWorker: true,
+
+	output: {
+		format: "image/png",
+		type: "foreground",
+		quality: 1,
+	},
+};
+
+/*
+ * Smaller fallback model.
+ *
+ * This is important for browsers where fp16/WebGPU
+ * produces the B.Gb null runtime error.
+ */
+const AI_FALLBACK_CONFIG = {
+	model: "isnet_quint8",
+	device: "cpu",
+
+	proxyToWorker: true,
+
+	output: {
+		format: "image/png",
+		type: "foreground",
+		quality: 1,
+	},
+};
+
+function supportsWebGPU() {
+	return typeof navigator !== "undefined" && !!navigator.gpu;
 }
+
+function getAIConfig() {
+	if (supportsWebGPU()) {
+		return AI_PRIMARY_CONFIG;
+	}
+
+	return {
+		...AI_PRIMARY_CONFIG,
+		device: "cpu",
+	};
+}
+
+/*
+ * No eager model preload.
+ */
+async function prepareBackgroundRemoval() {
+	if (backgroundRemovalReady) {
+		return;
+	}
+
+	if (!backgroundRemovalLoading) {
+		backgroundRemovalLoading = Promise.resolve().then(() => {
+			backgroundRemovalReady = true;
+		});
+	}
+
+	await backgroundRemovalLoading;
+}
+
+/* ---------------------------------------------------------------------- */
+/* PREPARE AI INPUT                                                       */
+/* ---------------------------------------------------------------------- */
 
 async function prepareAIInput(src) {
 	const img = await loadImageEl(src);
 
 	const originalWidth = img.naturalWidth;
-	const originalHeight = img.naturalHeight;
 
-	if (!originalWidth || !originalHeight) {
-		throw new Error("Invalid image dimensions.");
-	}
+	const originalHeight = img.naturalHeight;
 
 	const maxSide = Math.max(originalWidth, originalHeight);
 
@@ -388,6 +383,9 @@ async function prepareAIInput(src) {
 
 	const height = Math.max(1, Math.round(originalHeight * scale));
 
+	/*
+	 * Already small enough.
+	 */
 	if (width === originalWidth && height === originalHeight) {
 		return {
 			blob: null,
@@ -414,11 +412,14 @@ async function prepareAIInput(src) {
 
 	ctx.imageSmoothingEnabled = true;
 	ctx.imageSmoothingQuality = "high";
-	ctx.clearRect(0, 0, width, height);
+
 	ctx.drawImage(img, 0, 0, width, height);
 
-	const blob = await canvasToBlob(canvas, "image/png", 1);
+	const blob = await canvasToBlob(canvas, "image/jpeg", 0.92);
 
+	/*
+	 * Release canvas backing memory.
+	 */
 	canvas.width = 1;
 	canvas.height = 1;
 
@@ -433,12 +434,34 @@ async function prepareAIInput(src) {
 	};
 }
 
+/* ---------------------------------------------------------------------- */
+/* REMOVE BACKGROUND                                                      */
+/* ---------------------------------------------------------------------- */
+
 async function removeBackgroundAI(src) {
+	await prepareBackgroundRemoval();
+
 	const aiInput = await prepareAIInput(src);
 
 	try {
+		const input = aiInput.blob || src;
+
+		/*
+		 * ---------------------------------------------------------------
+		 * FIRST ATTEMPT
+		 * ---------------------------------------------------------------
+		 */
 		try {
-			const result = await aiRemoveBackground(aiInput.blob || src, AI_CONFIG);
+			const config = getAIConfig();
+
+			console.log("[BG] Starting AI background removal:", {
+				model: config.model,
+				device: config.device,
+				width: aiInput.width,
+				height: aiInput.height,
+			});
+
+			const result = await aiRemoveBackground(input, config);
 
 			if (!(result instanceof Blob)) {
 				throw new Error("Background removal returned an invalid image.");
@@ -446,10 +469,23 @@ async function removeBackgroundAI(src) {
 
 			return result;
 		} catch (primaryError) {
-			console.warn("WebGPU/FP16 failed. Retrying with CPU/WASM.", primaryError);
+			console.warn(
+				"[BG] Primary model failed. Using fallback model.",
+				primaryError,
+			);
 
+			/*
+			 * -------------------------------------------------------------
+			 * FALLBACK
+			 * -------------------------------------------------------------
+			 *
+			 * Handles browser/WebGPU/FP16 failures such as:
+			 *
+			 * TypeError:
+			 * can't access property "hc", B.Gb is null
+			 */
 			const fallbackResult = await aiRemoveBackground(
-				aiInput.blob || src,
+				input,
 				AI_FALLBACK_CONFIG,
 			);
 
@@ -460,6 +496,9 @@ async function removeBackgroundAI(src) {
 			return fallbackResult;
 		}
 	} finally {
+		/*
+		 * Release temporary resized image.
+		 */
 		if (aiInput.temporary && aiInput.src) {
 			URL.revokeObjectURL(aiInput.src);
 		}
@@ -467,6 +506,10 @@ async function removeBackgroundAI(src) {
 		await yieldToBrowser();
 	}
 }
+
+/* ---------------------------------------------------------------------- */
+/* CANVAS HELPERS                                                         */
+/* ---------------------------------------------------------------------- */
 
 function drawEnhancedImage(
 	img,
@@ -494,7 +537,10 @@ function drawEnhancedImage(
 		ctx.globalCompositeOperation = "source-over";
 	}
 
-	if (enhance && !transparent) {
+	/*
+	 * Subtle enhancement.
+	 */
+	if (enhance) {
 		ctx.filter = "contrast(1.045) saturate(1.025) brightness(1.005)";
 	}
 
@@ -502,9 +548,14 @@ function drawEnhancedImage(
 
 	ctx.filter = "none";
 
+	/*
+	 * Mild sharpening only for normal images.
+	 */
 	if (enhance && !transparent) {
 		ctx.globalAlpha = 0.08;
+
 		ctx.globalCompositeOperation = "source-over";
+
 		ctx.filter = "contrast(1.08)";
 
 		ctx.drawImage(img, 0, 0, width, height);
@@ -516,6 +567,34 @@ function drawEnhancedImage(
 	return canvas;
 }
 
+/* ---------------------------------------------------------------------- */
+/* CANVAS -> BLOB                                                         */
+/* ---------------------------------------------------------------------- */
+
+function canvasToBlob(canvas, mime, quality) {
+	return new Promise((resolve, reject) => {
+		try {
+			canvas.toBlob(
+				(blob) => {
+					if (blob) {
+						resolve(blob);
+					} else {
+						reject(new Error("Image encoding failed."));
+					}
+				},
+				mime,
+				quality,
+			);
+		} catch (error) {
+			reject(error);
+		}
+	});
+}
+
+/* ---------------------------------------------------------------------- */
+/* JPEG <= 1 MB                                                           */
+/* ---------------------------------------------------------------------- */
+
 async function encodeJpegUnderLimit(img, width, height, quality, enhance) {
 	let currentWidth = width;
 	let currentHeight = height;
@@ -526,6 +605,9 @@ async function encodeJpegUnderLimit(img, width, height, quality, enhance) {
 	let bestWidth = width;
 	let bestHeight = height;
 
+	/*
+	 * Maximum 7 encodes instead of 12.
+	 */
 	for (let attempt = 0; attempt < 7; attempt++) {
 		const canvas = drawEnhancedImage(img, currentWidth, currentHeight, {
 			enhance,
@@ -534,6 +616,9 @@ async function encodeJpegUnderLimit(img, width, height, quality, enhance) {
 
 		const blob = await canvasToBlob(canvas, "image/jpeg", currentQuality);
 
+		/*
+		 * Release canvas memory.
+		 */
 		canvas.width = 1;
 		canvas.height = 1;
 
@@ -554,12 +639,18 @@ async function encodeJpegUnderLimit(img, width, height, quality, enhance) {
 
 		await yieldToBrowser();
 
+		/*
+		 * Reduce quality first.
+		 */
 		if (currentQuality > MIN_JPEG_QUALITY) {
 			currentQuality = Math.max(MIN_JPEG_QUALITY, currentQuality - 0.1);
 
 			continue;
 		}
 
+		/*
+		 * Then reduce dimensions.
+		 */
 		currentWidth = Math.max(320, Math.round(currentWidth * 0.82));
 
 		currentHeight = Math.max(320, Math.round(currentHeight * 0.82));
@@ -575,6 +666,10 @@ async function encodeJpegUnderLimit(img, width, height, quality, enhance) {
 	};
 }
 
+/* ---------------------------------------------------------------------- */
+/* PNG <= 1 MB                                                            */
+/* ---------------------------------------------------------------------- */
+
 async function encodePngUnderLimit(img, width, height, enhance) {
 	let currentWidth = width;
 	let currentHeight = height;
@@ -583,14 +678,20 @@ async function encodePngUnderLimit(img, width, height, enhance) {
 	let bestWidth = width;
 	let bestHeight = height;
 
-	for (let attempt = 0; attempt < 6; attempt++) {
+	/*
+	 * Five attempts instead of 14.
+	 */
+	for (let attempt = 0; attempt < 5; attempt++) {
 		const canvas = drawEnhancedImage(img, currentWidth, currentHeight, {
-			enhance: false,
+			enhance,
 			transparent: true,
 		});
 
 		const blob = await canvasToBlob(canvas, "image/png", 1);
 
+		/*
+		 * Release canvas memory.
+		 */
 		canvas.width = 1;
 		canvas.height = 1;
 
@@ -611,7 +712,10 @@ async function encodePngUnderLimit(img, width, height, enhance) {
 
 		await yieldToBrowser();
 
-		const scale = attempt === 0 ? 0.88 : 0.78;
+		/*
+		 * Reduce dimensions.
+		 */
+		const scale = attempt === 0 ? 0.82 : 0.75;
 
 		currentWidth = Math.max(320, Math.round(currentWidth * scale));
 
@@ -626,6 +730,10 @@ async function encodePngUnderLimit(img, width, height, enhance) {
 	};
 }
 
+/* ---------------------------------------------------------------------- */
+/* MAIN IMAGE PROCESSOR                                                   */
+/* ---------------------------------------------------------------------- */
+
 async function processImage(item, settings) {
 	const img = await loadImageEl(
 		item.workingSrc,
@@ -634,10 +742,6 @@ async function processImage(item, settings) {
 
 	let w = img.naturalWidth;
 	let h = img.naturalHeight;
-
-	if (!w || !h) {
-		throw new Error("Invalid image dimensions.");
-	}
 
 	const cap = settings.optimize
 		? Math.min(settings.maxDimension, MAX_WORK_DIM)
@@ -649,8 +753,20 @@ async function processImage(item, settings) {
 
 	h = Math.max(1, Math.round(h * scale));
 
+	/* ------------------------------------------------------------------ */
+	/* AI BACKGROUND REMOVAL                                              */
+	/* ------------------------------------------------------------------ */
+
 	if (settings.removeBg) {
 		try {
+			/*
+			 * The function internally:
+			 *
+			 * 1. Resizes the input to max 2048px for AI
+			 * 2. Runs GPU/fp16 where possible
+			 * 3. Falls back to quint8 CPU if necessary
+			 * 4. Releases temporary memory
+			 */
 			const aiBlob = await removeBackgroundAI(item.workingSrc);
 
 			if (!(aiBlob instanceof Blob)) {
@@ -662,6 +778,10 @@ async function processImage(item, settings) {
 			try {
 				const transparentImg = await loadImageEl(aiUrl);
 
+				/*
+				 * If nothing else is enabled,
+				 * return the AI result directly.
+				 */
 				if (!settings.optimize && !settings.enhance) {
 					return {
 						blob: aiBlob,
@@ -671,6 +791,9 @@ async function processImage(item, settings) {
 					};
 				}
 
+				/*
+				 * Final output dimensions.
+				 */
 				let outputWidth = transparentImg.naturalWidth;
 
 				let outputHeight = transparentImg.naturalHeight;
@@ -688,11 +811,14 @@ async function processImage(item, settings) {
 					outputHeight = Math.max(1, Math.round(outputHeight * outputScale));
 				}
 
+				/*
+				 * Transparent image remains PNG.
+				 */
 				return await encodePngUnderLimit(
 					transparentImg,
 					outputWidth,
 					outputHeight,
-					false,
+					settings.enhance,
 				);
 			} finally {
 				URL.revokeObjectURL(aiUrl);
@@ -709,6 +835,10 @@ async function processImage(item, settings) {
 		}
 	}
 
+	/* ------------------------------------------------------------------ */
+	/* NORMAL IMAGE OPTIMIZATION                                          */
+	/* ------------------------------------------------------------------ */
+
 	if (settings.optimize || settings.enhance) {
 		return await encodeJpegUnderLimit(
 			img,
@@ -718,6 +848,10 @@ async function processImage(item, settings) {
 			settings.enhance,
 		);
 	}
+
+	/* ------------------------------------------------------------------ */
+	/* NO PROCESSING                                                       */
+	/* ------------------------------------------------------------------ */
 
 	const canvas = document.createElement("canvas");
 
@@ -747,29 +881,40 @@ async function processImage(item, settings) {
 	};
 }
 
+/* ---------------------------------------------------------------------- */
+/* COMPONENT                                                              */
+/* ---------------------------------------------------------------------- */
+
 let nextId = 1;
 
 export default function ImageGrabberOptimizer() {
 	const [items, setItems] = useState([]);
+
 	const [isDragging, setIsDragging] = useState(false);
+
 	const [urlInput, setUrlInput] = useState("");
+
 	const [processing, setProcessing] = useState(false);
+
 	const [processingIndex, setProcessingIndex] = useState(0);
+
 	const [processingTotal, setProcessingTotal] = useState(0);
+
 	const [removeBg, setRemoveBg] = useState(false);
+
 	const [optimize, setOptimize] = useState(true);
+
 	const [enhance, setEnhance] = useState(true);
+
 	const [quality, setQuality] = useState(0.82);
+
 	const [maxDimension, setMaxDimension] = useState(1600);
-  const [downloadDirectory, setDownloadDirectory] = useState(null);
-	const [selectingDirectory, setSelectingDirectory] = useState(false);
-	const [isSelectingDirectory, setIsSelectingDirectory] = useState(false);
 
 	const fileInputRef = useRef(null);
 
-	const supportsDirectoryDownload =
-		typeof window !== "undefined" &&
-		typeof window.showDirectoryPicker === "function";
+	/* ------------------------------------------------------------------ */
+	/* CLEANUP                                                             */
+	/* ------------------------------------------------------------------ */
 
 	useEffect(() => {
 		return () => {
@@ -785,55 +930,9 @@ export default function ImageGrabberOptimizer() {
 		};
 	}, []);
 
-  const selectDownloadDirectory = useCallback(async () => {
-		if (
-			typeof window === "undefined" ||
-			typeof window.showDirectoryPicker !== "function"
-		) {
-			return null;
-		}
-
-		try {
-			setSelectingDirectory(true);
-
-			const directoryHandle = await window.showDirectoryPicker({
-				mode: "readwrite",
-				startIn: "downloads",
-			});
-
-			const permission = await directoryHandle.queryPermission({
-				mode: "readwrite",
-			});
-
-			if (permission !== "granted") {
-				const requestedPermission = await directoryHandle.requestPermission({
-					mode: "readwrite",
-				});
-
-				if (requestedPermission !== "granted") {
-					throw new Error(
-						"Permission to write to the selected folder was denied.",
-					);
-				}
-			}
-
-			setDownloadDirectory(directoryHandle);
-
-			return directoryHandle;
-		} catch (error) {
-			if (error?.name === "AbortError") {
-				return null;
-			}
-
-			console.error("Folder selection failed:", error);
-
-			alert(error?.message || "Unable to select the download folder.");
-
-			return null;
-		} finally {
-			setSelectingDirectory(false);
-		}
-	}, []);
+	/* ------------------------------------------------------------------ */
+	/* ADD FILES                                                           */
+	/* ------------------------------------------------------------------ */
 
 	const addFiles = useCallback((fileList) => {
 		const files = Array.from(fileList).filter((f) =>
@@ -846,6 +945,7 @@ export default function ImageGrabberOptimizer() {
 
 		setItems((prev) => [
 			...prev,
+
 			...files.map((file) => {
 				const objectUrl = URL.createObjectURL(file);
 
@@ -866,6 +966,10 @@ export default function ImageGrabberOptimizer() {
 		]);
 	}, []);
 
+	/* ------------------------------------------------------------------ */
+	/* ADD URL                                                             */
+	/* ------------------------------------------------------------------ */
+
 	const addUrl = useCallback(async (rawUrl) => {
 		const url = rawUrl.trim();
 
@@ -881,7 +985,9 @@ export default function ImageGrabberOptimizer() {
 			name = decodeURIComponent(
 				u.pathname.split("/").filter(Boolean).pop() || "image",
 			);
-		} catch {}
+		} catch {
+			// keep default
+		}
 
 		const id = nextId++;
 
@@ -934,6 +1040,9 @@ export default function ImageGrabberOptimizer() {
 				),
 			);
 		} catch {
+			/*
+			 * Fall back to direct image loading.
+			 */
 			setItems((prev) =>
 				prev.map((it) =>
 					it.id === id
@@ -949,6 +1058,10 @@ export default function ImageGrabberOptimizer() {
 			);
 		}
 	}, []);
+
+	/* ------------------------------------------------------------------ */
+	/* REMOVE ITEM                                                         */
+	/* ------------------------------------------------------------------ */
 
 	const removeItem = useCallback(
 		(id) => {
@@ -973,6 +1086,10 @@ export default function ImageGrabberOptimizer() {
 		[processing],
 	);
 
+	/* ------------------------------------------------------------------ */
+	/* CLEAR ALL                                                           */
+	/* ------------------------------------------------------------------ */
+
 	const clearAll = useCallback(() => {
 		if (processing) {
 			return;
@@ -990,6 +1107,10 @@ export default function ImageGrabberOptimizer() {
 
 		setItems([]);
 	}, [items, processing]);
+
+	/* ------------------------------------------------------------------ */
+	/* DROP                                                                */
+	/* ------------------------------------------------------------------ */
 
 	const handleDrop = useCallback(
 		(e) => {
@@ -1014,6 +1135,10 @@ export default function ImageGrabberOptimizer() {
 		[addFiles, addUrl],
 	);
 
+	/* ------------------------------------------------------------------ */
+	/* PROCESS - SEQUENTIAL QUEUE                                          */
+	/* ------------------------------------------------------------------ */
+
 	const handleProcess = useCallback(async () => {
 		if (!removeBg && !optimize && !enhance) {
 			return;
@@ -1030,6 +1155,7 @@ export default function ImageGrabberOptimizer() {
 		}
 
 		setProcessing(true);
+
 		setProcessingIndex(0);
 		setProcessingTotal(current.length);
 
@@ -1050,6 +1176,13 @@ export default function ImageGrabberOptimizer() {
 		);
 
 		try {
+			/*
+			 * IMPORTANT:
+			 *
+			 * ONE IMAGE AT A TIME.
+			 *
+			 * Do NOT use Promise.all().
+			 */
 			for (let index = 0; index < current.length; index++) {
 				const item = current[index];
 
@@ -1066,9 +1199,14 @@ export default function ImageGrabberOptimizer() {
 					),
 				);
 
+				/*
+				 * Allow React to render the processing state.
+				 */
 				await yieldToBrowser();
 
 				try {
+					console.log(`[IMAGE ${index + 1}/${current.length}] ${item.name}`);
+
 					const result = await processImage(item, settings);
 
 					const url = URL.createObjectURL(result.blob);
@@ -1079,6 +1217,7 @@ export default function ImageGrabberOptimizer() {
 								? {
 										...it,
 										processStatus: "done",
+
 										processed: {
 											blob: result.blob,
 											url,
@@ -1100,6 +1239,7 @@ export default function ImageGrabberOptimizer() {
 								? {
 										...it,
 										processStatus: "error",
+
 										processError: err?.message || "Processing failed.",
 									}
 								: it,
@@ -1107,8 +1247,15 @@ export default function ImageGrabberOptimizer() {
 					);
 				}
 
+				/*
+				 * Give browser time to release memory
+				 * and repaint UI.
+				 */
 				await yieldToBrowser();
 
+				/*
+				 * Small gap between heavy jobs.
+				 */
 				await new Promise((resolve) => setTimeout(resolve, 50));
 			}
 		} finally {
@@ -1118,53 +1265,17 @@ export default function ImageGrabberOptimizer() {
 		}
 	}, [items, processing, removeBg, optimize, enhance, quality, maxDimension]);
 
-	const handleSelectDownloadDirectory = useCallback(async () => {
-		if (!supportsDirectoryDownload || isSelectingDirectory) {
+	/* ------------------------------------------------------------------ */
+	/* DOWNLOAD                                                            */
+	/* ------------------------------------------------------------------ */
+
+	const handleDownload = useCallback(() => {
+		const done = items.filter(
+			(it) => it.processStatus === "done" && it.processed,
+		);
+
+		if (!done.length) {
 			return;
-		}
-
-		setIsSelectingDirectory(true);
-
-		try {
-			const directory = await selectDownloadDirectory();
-
-			if (directory) {
-				setDownloadDirectory(directory);
-			}
-		} finally {
-			setIsSelectingDirectory(false);
-		}
-	}, [supportsDirectoryDownload, isSelectingDirectory]);
-
-const handleDownload = useCallback(async () => {
-	const done = items.filter(
-		(it) =>
-			it.processStatus === "done" &&
-			it.processed &&
-			it.processed.blob instanceof Blob &&
-			it.processed.blob.size > 0,
-	);
-
-	if (!done.length) {
-		return;
-	}
-
-	const supportsDirectoryPicker =
-		typeof window !== "undefined" &&
-		typeof window.showDirectoryPicker === "function" &&
-		window.isSecureContext;
-
-	let directoryHandle = downloadDirectory;
-
-	try {
-		if (supportsDirectoryPicker) {
-			if (!directoryHandle) {
-				directoryHandle = await selectDownloadDirectory();
-
-				if (!directoryHandle) {
-					return;
-				}
-			}
 		}
 
 		if (done.length === 1) {
@@ -1172,100 +1283,55 @@ const handleDownload = useCallback(async () => {
 
 			const ext = it.processed.mime === "image/png" ? "png" : "jpg";
 
-			const filename = `${stripExt(it.name)}-optimized.${ext}`;
-
-			if (supportsDirectoryPicker && directoryHandle) {
-				await downloadToDirectory(it.processed.blob, filename, directoryHandle);
-			} else {
-				downloadBlob(it.processed.blob, filename);
-			}
+			downloadBlob(it.processed.blob, `${stripExt(it.name)}-optimized.${ext}`);
 
 			return;
 		}
 
-		const usedNames = new Set();
-		const entries = [];
+		(async () => {
+			const used = new Set();
 
-		for (const it of done) {
-			const ext = it.processed.mime === "image/png" ? "png" : "jpg";
+			const entries = [];
 
-			const baseName = stripExt(it.name);
+			for (const it of done) {
+				const ext = it.processed.mime === "image/png" ? "png" : "jpg";
 
-			let filename = `${baseName}-optimized.${ext}`;
+				let name = `${stripExt(it.name)}-optimized.${ext}`;
 
-			let counter = 2;
+				let n = 2;
 
-			while (usedNames.has(filename)) {
-				filename = `${baseName}-optimized (${counter}).${ext}`;
+				while (used.has(name)) {
+					name = `${stripExt(it.name)}-optimized (${n}).${ext}`;
 
-				counter++;
+					n++;
+				}
+
+				used.add(name);
+
+				const buf = await it.processed.blob.arrayBuffer();
+
+				entries.push({
+					name,
+					data: new Uint8Array(buf),
+				});
+
+				await yieldToBrowser();
 			}
 
-			usedNames.add(filename);
+			const zipBytes = buildZip(entries);
 
-			const arrayBuffer = await it.processed.blob.arrayBuffer();
-
-			const data = new Uint8Array(arrayBuffer);
-
-			if (!data.length) {
-				continue;
-			}
-
-			entries.push({
-				name: filename,
-				data,
-			});
-
-			await yieldToBrowser();
-		}
-
-		if (!entries.length) {
-			throw new Error("No valid processed images were available.");
-		}
-
-		const zipBytes = buildZip(entries);
-
-		if (
-			zipBytes.length < 22 ||
-			zipBytes[0] !== 0x50 ||
-			zipBytes[1] !== 0x4b ||
-			zipBytes[2] !== 0x03 ||
-			zipBytes[3] !== 0x04
-		) {
-			throw new Error("Generated ZIP has an invalid signature.");
-		}
-
-		const zipBlob = new Blob([zipBytes.buffer], {
-			type: "application/zip",
-		});
-
-		if (supportsDirectoryPicker && directoryHandle) {
-			await downloadToDirectory(
-				zipBlob,
+			downloadBlob(
+				new Blob([zipBytes], {
+					type: "application/zip",
+				}),
 				"optimized-images.zip",
-				directoryHandle,
 			);
-		} else {
-			downloadBlob(zipBlob, "optimized-images.zip");
-		}
-	} catch (error) {
-		console.error("Download failed:", error);
+		})();
+	}, [items]);
 
-		if (error?.name === "AbortError") {
-			return;
-		}
-
-		if (error?.name === "NotAllowedError") {
-			setDownloadDirectory(null);
-
-			alert("Permission to write to the selected folder was denied.");
-
-			return;
-		}
-
-		alert(error?.message || "Unable to save the processed files.");
-	}
-}, [items, downloadDirectory, selectDownloadDirectory]);
+	/* ------------------------------------------------------------------ */
+	/* STATS                                                               */
+	/* ------------------------------------------------------------------ */
 
 	const doneItems = items.filter(
 		(it) => it.processStatus === "done" && it.processed,
@@ -1292,6 +1358,10 @@ const handleDownload = useCallback(async () => {
 		(it) => it.processed.size > MAX_OUTPUT_BYTES,
 	).length;
 
+	/* ------------------------------------------------------------------ */
+	/* COLORS                                                              */
+	/* ------------------------------------------------------------------ */
+
 	const colors = {
 		bg: "#14181B",
 		panel: "#1B2023",
@@ -1305,6 +1375,10 @@ const handleDownload = useCallback(async () => {
 		bad: "#E8615A",
 	};
 
+	/* ------------------------------------------------------------------ */
+	/* UI                                                                  */
+	/* ------------------------------------------------------------------ */
+
 	return (
 		<div
 			style={{
@@ -1314,31 +1388,33 @@ const handleDownload = useCallback(async () => {
 			}}
 			className="w-full rounded-xl p-6 font-sans">
 			<style>{`
-				.checker {
-					background-image:
-						linear-gradient(45deg, #333 25%, transparent 25%),
-						linear-gradient(-45deg, #333 25%, transparent 25%),
-						linear-gradient(45deg, transparent 75%, #333 75%),
-						linear-gradient(-45deg, transparent 75%, #333 75%);
-					background-size: 12px 12px;
-					background-position:
-						0 0,
-						0 6px,
-						6px -6px,
-						-6px 0;
-					background-color: #1a1a1a;
-				}
+        .checker {
+          background-image:
+            linear-gradient(45deg, #333 25%, transparent 25%),
+            linear-gradient(-45deg, #333 25%, transparent 25%),
+            linear-gradient(45deg, transparent 75%, #333 75%),
+            linear-gradient(-45deg, transparent 75%, #333 75%);
+          background-size: 12px 12px;
+          background-position:
+            0 0,
+            0 6px,
+            6px -6px,
+            -6px 0;
+          background-color: #1a1a1a;
+        }
 
-				.mono {
-					font-variant-numeric: tabular-nums;
-					font-family:
-						ui-monospace,
-						SFMono-Regular,
-						Menlo,
-						Consolas,
-						monospace;
-				}
-			`}</style>
+        .mono {
+          font-variant-numeric: tabular-nums;
+          font-family:
+            ui-monospace,
+            SFMono-Regular,
+            Menlo,
+            Consolas,
+            monospace;
+        }
+      `}</style>
+
+			{/* HEADER */}
 
 			<div className="mb-6">
 				<div
@@ -1363,6 +1439,8 @@ const handleDownload = useCallback(async () => {
 				</p>
 			</div>
 
+			{/* INTAKE */}
+
 			<div
 				onDragOver={(e) => {
 					e.preventDefault();
@@ -1372,7 +1450,9 @@ const handleDownload = useCallback(async () => {
 				onDrop={handleDrop}
 				style={{
 					border: `1.5px dashed ${isDragging ? colors.accent : colors.border}`,
+
 					background: isDragging ? colors.accentDim + "33" : colors.panel,
+
 					borderRadius: 12,
 				}}
 				className="p-8 flex flex-col items-center justify-center text-center transition-colors">
@@ -1470,6 +1550,8 @@ const handleDownload = useCallback(async () => {
 				</div>
 			</div>
 
+			{/* LOADED IMAGES */}
+
 			{items.length > 0 && (
 				<div className="mt-6">
 					<div className="flex items-center justify-between mb-2">
@@ -1546,6 +1628,7 @@ const handleDownload = useCallback(async () => {
 									{it.processed && (
 										<>
 											{" → "}
+
 											<span
 												style={{
 													color: colors.good,
@@ -1619,6 +1702,8 @@ const handleDownload = useCallback(async () => {
 				</div>
 			)}
 
+			{/* SETTINGS */}
+
 			<div
 				style={{
 					background: colors.panel,
@@ -1627,6 +1712,8 @@ const handleDownload = useCallback(async () => {
 				}}
 				className="mt-6 p-4">
 				<div className="flex flex-wrap gap-5">
+					{/* REMOVE BG */}
+
 					<label className="flex items-center gap-2 text-sm cursor-pointer">
 						<input
 							type="checkbox"
@@ -1638,6 +1725,8 @@ const handleDownload = useCallback(async () => {
 						Remove background
 					</label>
 
+					{/* OPTIMIZE */}
+
 					<label className="flex items-center gap-2 text-sm cursor-pointer">
 						<input
 							type="checkbox"
@@ -1648,6 +1737,8 @@ const handleDownload = useCallback(async () => {
 						<Wand2 size={14} />
 						Optimize &amp; compress
 					</label>
+
+					{/* ENHANCE */}
 
 					<label className="flex items-center gap-2 text-sm cursor-pointer">
 						<input
@@ -1667,8 +1758,9 @@ const handleDownload = useCallback(async () => {
 						style={{
 							color: colors.textDim,
 						}}>
-						AI Processing may take several seconds per image. Works best on
-						images with a clear subject and background.
+						AI background removal automatically limits inference resolution to
+						reduce browser memory usage. GPU acceleration is used when
+						available, with an automatic smaller-model fallback.
 					</p>
 				)}
 
@@ -1678,12 +1770,14 @@ const handleDownload = useCallback(async () => {
 						style={{
 							color: colors.textDim,
 						}}>
-						Applies subtle clarity, contrast and sharpening while keeping normal
-						image output close to the 1 MB target.
+						Applies subtle clarity, contrast and sharpening while keeping the
+						output compressed to approximately 1 MB or less.
 					</p>
 				)}
 
 				<div className="grid sm:grid-cols-2 gap-4 mt-4">
+					{/* MAX DIMENSION */}
+
 					<div>
 						<div
 							className="flex justify-between text-xs mb-1"
@@ -1692,10 +1786,7 @@ const handleDownload = useCallback(async () => {
 							}}>
 							<span>Max dimension</span>
 
-							<span className="mono">
-								{maxDimension}
-								px
-							</span>
+							<span className="mono">{maxDimension}px</span>
 						</div>
 
 						<select
@@ -1719,6 +1810,8 @@ const handleDownload = useCallback(async () => {
 							<option value={2500}>2500px (original size if smaller)</option>
 						</select>
 					</div>
+
+					{/* JPEG QUALITY */}
 
 					<div>
 						<div
@@ -1754,6 +1847,8 @@ const handleDownload = useCallback(async () => {
 					</div>
 				</div>
 
+				{/* SIZE TARGET */}
+
 				<div
 					className="mt-4 rounded-lg px-3 py-2 text-xs flex items-center gap-2"
 					style={{
@@ -1771,6 +1866,8 @@ const handleDownload = useCallback(async () => {
 					per image
 				</div>
 			</div>
+
+			{/* ACTIONS */}
 
 			<div className="mt-6 flex flex-wrap items-center gap-3">
 				<button
@@ -1796,51 +1893,20 @@ const handleDownload = useCallback(async () => {
 					)}
 				</button>
 
-				{supportsDirectoryDownload && (
-					<button
-						onClick={handleSelectDownloadDirectory}
-						disabled={processing || isSelectingDirectory}
-						style={{
-							background: colors.panelAlt,
-							border: `1px solid ${colors.border}`,
-							color: colors.text,
-						}}
-						className="px-5 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 disabled:opacity-40">
-						{isSelectingDirectory ? (
-							<Loader2 size={16} className="animate-spin" />
-						) : (
-							<FolderOpen size={16} />
-						)}
-
-						{downloadDirectory
-							? "Download Folder Selected"
-							: "Select Download Folder"}
-					</button>
-				)}
-
 				<button
 					onClick={handleDownload}
-					disabled={!doneItems.length || processing || selectingDirectory}
+					disabled={!doneItems.length || processing}
 					style={{
 						background: colors.panelAlt,
 						border: `1px solid ${colors.border}`,
 						color: colors.text,
 					}}
 					className="px-5 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 disabled:opacity-40">
-					{selectingDirectory ? (
-						<>
-							<Loader2 size={16} className="animate-spin" />
-							Select folder...
-						</>
-					) : (
-						<>
-							<FolderOpen size={16} />
+					<Download size={16} />
 
-							{doneItems.length > 1
-								? `Choose folder & download ${doneItems.length} images`
-								: "Choose folder & download"}
-						</>
-					)}
+					{doneItems.length > 1
+						? `Download ${doneItems.length} images (.zip)`
+						: "Download image"}
 				</button>
 
 				{processing && (
@@ -1864,27 +1930,7 @@ const handleDownload = useCallback(async () => {
 				)}
 			</div>
 
-			{downloadDirectory && (
-				<div
-					className="mt-2 text-xs flex items-center gap-1"
-					style={{
-						color: colors.good,
-					}}>
-					<FolderOpen size={12} />
-					Files will be saved automatically to the selected folder.
-				</div>
-			)}
-
-			{!supportsDirectoryDownload && (
-				<div
-					className="mt-2 text-xs"
-					style={{
-						color: colors.textDim,
-					}}>
-					Your browser does not support direct folder downloads. Files will use
-					your browser's normal download location.
-				</div>
-			)}
+			{/* ERROR */}
 
 			{errorItems.length > 0 && (
 				<p
@@ -1897,6 +1943,8 @@ const handleDownload = useCallback(async () => {
 					in the download.
 				</p>
 			)}
+
+			{/* SAVINGS */}
 
 			{doneItems.length > 0 && (
 				<div
