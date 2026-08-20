@@ -827,7 +827,7 @@ export default function ImageGrabberOptimizer() {
 
 	const [quality, setQuality] = useState(0.82);
 
-	const [maxDimension, setMaxDimension] = useState(1600);
+	const [maxDimension, setMaxDimension] = useState(800);
 
 	const fileInputRef = useRef(null);
 
