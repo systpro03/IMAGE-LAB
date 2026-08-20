@@ -208,33 +208,48 @@ function loadImageEl(src, crossOrigin) {
 	});
 }
 
-function downloadBlob(blob, filename) {
-	const url = URL.createObjectURL(blob);
+async function downloadToDirectory(blob, filename) {
+	if (typeof window === "undefined") {
+		return false;
+	}
 
-	const a = document.createElement("a");
+	if (typeof window.showDirectoryPicker !== "function") {
+		alert(
+			"Folder selection is not available in this browser or page.\n\n" +
+				"Use the latest Google Chrome or Microsoft Edge and open this application using HTTPS or localhost.",
+		);
 
-	a.href = url;
-	a.download = filename;
+		return false;
+	}
 
-	document.body.appendChild(a);
+	try {
+		const directoryHandle = await window.showDirectoryPicker({
+			mode: "readwrite",
+			id: "image-grabber-download",
+		});
 
-	a.click();
+		const fileHandle = await directoryHandle.getFileHandle(filename, {
+			create: true,
+		});
 
-	a.remove();
+		const writable = await fileHandle.createWritable();
 
-	setTimeout(() => {
-		URL.revokeObjectURL(url);
-	}, 4000);
+		await writable.write(blob);
+		await writable.close();
+
+		return true;
+	} catch (error) {
+		if (error?.name === "AbortError") {
+			return false;
+		}
+
+		console.error("Directory selection/download failed:", error);
+
+		alert(`Unable to save the file.\n\n${error?.message || "Unknown error"}`);
+
+		return false;
+	}
 }
-
-/* ---------------------------------------------------------------------- */
-/* BROWSER YIELD                                                         */
-/* ---------------------------------------------------------------------- */
-
-/*
- * Allows the browser to repaint and respond to user interaction
- * between heavy operations.
- */
 function yieldToBrowser() {
 	return new Promise((resolve) => {
 		if (typeof requestIdleCallback === "function") {
@@ -912,10 +927,40 @@ export default function ImageGrabberOptimizer() {
 
 	const fileInputRef = useRef(null);
 
+  const [downloadDirectory, setDownloadDirectory] = useState(null);
+	const [showDownloadDialog, setShowDownloadDialog] = useState(false);
+	const [selectingDirectory, setSelectingDirectory] = useState(false);
+	const [downloading, setDownloading] = useState(false);
+
 	/* ------------------------------------------------------------------ */
 	/* CLEANUP                                                             */
 	/* ------------------------------------------------------------------ */
+const selectDownloadDirectory = useCallback(async () => {
+	if (typeof window.showDirectoryPicker !== "function") {
+		alert(
+			"Folder selection is not available in this browser environment. " +
+				"Please run this application using HTTPS or localhost in a current version of Chrome or Edge.",
+		);
+		return;
+	}
 
+	try {
+		setSelectingDirectory(true);
+
+		const directory = await window.showDirectoryPicker({
+			mode: "readwrite",
+			id: "image-grabber-download",
+		});
+
+		setDownloadDirectory(directory);
+	} catch (error) {
+		if (error?.name !== "AbortError") {
+			console.error("Directory selection failed:", error);
+		}
+	} finally {
+		setSelectingDirectory(false);
+	}
+}, []);
 	useEffect(() => {
 		return () => {
 			items.forEach((it) => {
@@ -1269,28 +1314,39 @@ export default function ImageGrabberOptimizer() {
 	/* DOWNLOAD                                                            */
 	/* ------------------------------------------------------------------ */
 
-	const handleDownload = useCallback(() => {
+const handleDownload = useCallback(
+	async (directoryHandle) => {
 		const done = items.filter(
 			(it) => it.processStatus === "done" && it.processed,
 		);
 
-		if (!done.length) {
+		if (!done.length || !directoryHandle) {
 			return;
 		}
 
-		if (done.length === 1) {
-			const it = done[0];
+		try {
+			setDownloading(true);
 
-			const ext = it.processed.mime === "image/png" ? "png" : "jpg";
+			if (done.length === 1) {
+				const it = done[0];
 
-			downloadBlob(it.processed.blob, `${stripExt(it.name)}-optimized.${ext}`);
+				const ext = it.processed.mime === "image/png" ? "png" : "jpg";
 
-			return;
-		}
+				const filename = `${stripExt(it.name)}-optimized.${ext}`;
 
-		(async () => {
+				const fileHandle = await directoryHandle.getFileHandle(filename, {
+					create: true,
+				});
+
+				const writable = await fileHandle.createWritable();
+
+				await writable.write(it.processed.blob);
+				await writable.close();
+
+				return;
+			}
+
 			const used = new Set();
-
 			const entries = [];
 
 			for (const it of done) {
@@ -1302,17 +1358,16 @@ export default function ImageGrabberOptimizer() {
 
 				while (used.has(name)) {
 					name = `${stripExt(it.name)}-optimized (${n}).${ext}`;
-
 					n++;
 				}
 
 				used.add(name);
 
-				const buf = await it.processed.blob.arrayBuffer();
+				const buffer = await it.processed.blob.arrayBuffer();
 
 				entries.push({
 					name,
-					data: new Uint8Array(buf),
+					data: new Uint8Array(buffer),
 				});
 
 				await yieldToBrowser();
@@ -1320,14 +1375,33 @@ export default function ImageGrabberOptimizer() {
 
 			const zipBytes = buildZip(entries);
 
-			downloadBlob(
-				new Blob([zipBytes], {
-					type: "application/zip",
-				}),
+			const zipBlob = new Blob([zipBytes], {
+				type: "application/zip",
+			});
+
+			const fileHandle = await directoryHandle.getFileHandle(
 				"optimized-images.zip",
+				{
+					create: true,
+				},
 			);
-		})();
-	}, [items]);
+
+			const writable = await fileHandle.createWritable();
+
+			await writable.write(zipBlob);
+			await writable.close();
+		} catch (error) {
+			console.error("Download failed:", error);
+
+			if (error?.name !== "AbortError") {
+				alert(error?.message || "Unable to save the files.");
+			}
+		} finally {
+			setDownloading(false);
+		}
+	},
+	[items],
+);
 
 	/* ------------------------------------------------------------------ */
 	/* STATS                                                               */
@@ -1894,8 +1968,15 @@ export default function ImageGrabberOptimizer() {
 				</button>
 
 				<button
-					onClick={handleDownload}
-					disabled={!doneItems.length || processing}
+					onClick={async () => {
+						if (!downloadDirectory) {
+							setShowDownloadDialog(true);
+							return;
+						}
+
+						await handleDownload(downloadDirectory);
+					}}
+					disabled={!doneItems.length || processing || downloading}
 					style={{
 						background: colors.panelAlt,
 						border: `1px solid ${colors.border}`,
@@ -1903,7 +1984,6 @@ export default function ImageGrabberOptimizer() {
 					}}
 					className="px-5 py-2.5 rounded-lg text-sm font-medium flex items-center gap-2 disabled:opacity-40">
 					<Download size={16} />
-
 					{doneItems.length > 1
 						? `Download ${doneItems.length} images (.zip)`
 						: "Download image"}
@@ -2019,6 +2099,136 @@ export default function ImageGrabberOptimizer() {
 								color: overLimitCount > 0 ? colors.bad : colors.good,
 							}}>
 							{overLimitCount > 0 ? `${overLimitCount} over` : "≤ 1 MB"}
+						</div>
+					</div>
+				</div>
+			)}
+
+			{showDownloadDialog && (
+				<div
+					style={{
+						position: "fixed",
+						inset: 0,
+						background: "rgba(0,0,0,0.65)",
+						display: "flex",
+						alignItems: "center",
+						justifyContent: "center",
+						zIndex: 9999,
+						padding: 20,
+					}}>
+					<div
+						style={{
+							width: "100%",
+							maxWidth: 460,
+							background: colors.panel,
+							border: `1px solid ${colors.border}`,
+							borderRadius: 14,
+							padding: 24,
+							boxShadow: "0 20px 60px rgba(0,0,0,0.4)",
+						}}>
+						<div
+							style={{
+								fontSize: 18,
+								fontWeight: 600,
+								marginBottom: 8,
+							}}>
+							Choose download directory
+						</div>
+
+						<div
+							style={{
+								fontSize: 13,
+								color: colors.textDim,
+								marginBottom: 20,
+							}}>
+							Select the folder where the processed image
+							{doneItems.length > 1 ? "s" : ""} will be saved.
+						</div>
+
+						<div
+							style={{
+								background: colors.panelAlt,
+								border: `1px solid ${colors.border}`,
+								borderRadius: 9,
+								padding: 12,
+								marginBottom: 16,
+								fontSize: 13,
+							}}>
+							{downloadDirectory ? (
+								<div>
+									<div
+										style={{
+											color: colors.good,
+											fontWeight: 500,
+											marginBottom: 3,
+										}}>
+										Directory selected
+									</div>
+
+									<div
+										style={{
+											color: colors.textDim,
+										}}>
+										Ready to save files
+									</div>
+								</div>
+							) : (
+								<div
+									style={{
+										color: colors.textDim,
+									}}>
+									No directory selected
+								</div>
+							)}
+						</div>
+
+						<div
+							style={{
+								display: "flex",
+								gap: 10,
+								justifyContent: "flex-end",
+							}}>
+							<button
+								onClick={() => {
+									setShowDownloadDialog(false);
+								}}
+								style={{
+									background: colors.panelAlt,
+									border: `1px solid ${colors.border}`,
+									color: colors.text,
+								}}
+								className="px-4 py-2 rounded-lg text-sm">
+								Cancel
+							</button>
+
+							<button
+								onClick={async () => {
+									await selectDownloadDirectory();
+								}}
+								disabled={selectingDirectory}
+								style={{
+									background: colors.panelAlt,
+									border: `1px solid ${colors.border}`,
+									color: colors.text,
+								}}
+								className="px-4 py-2 rounded-lg text-sm flex items-center gap-2 disabled:opacity-40">
+								<FolderOpen size={15} />
+								{selectingDirectory ? "Selecting..." : "Choose Directory"}
+							</button>
+
+							<button
+								disabled={!downloadDirectory || downloading}
+								onClick={async () => {
+									await handleDownload(downloadDirectory);
+									setShowDownloadDialog(false);
+								}}
+								style={{
+									background: colors.accent,
+									color: "#211505",
+								}}
+								className="px-4 py-2 rounded-lg text-sm font-medium disabled:opacity-40">
+								{downloading ? "Saving..." : "Proceed"}
+							</button>
 						</div>
 					</div>
 				</div>
