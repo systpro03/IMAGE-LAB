@@ -17,6 +17,60 @@ import {
 import { removeBackground as aiRemoveBackground } from "@imgly/background-removal";
 
 /* ---------------------------------------------------------------------- */
+/* CONSTANTS                                                              */
+/* ---------------------------------------------------------------------- */
+
+const MAX_OUTPUT_BYTES = 1024 * 1024;
+const MIN_JPEG_QUALITY = 0.45;
+
+/*
+ * Maximum dimensions for normal image processing.
+ */
+const MAX_WORK_DIM = 2500;
+
+/*
+ * Maximum dimension sent to the segmentation model.
+ *
+ * 2048 gives substantially better edge detail than very small inference
+ * sizes while preventing huge images from consuming excessive memory.
+ */
+const AI_MAX_DIMENSION = 2048;
+
+/*
+ * Primary model.
+ *
+ * isnet_fp16 provides a better quality/speed balance than the quantized
+ * quint8 model.
+ */
+const AI_CONFIG = {
+	model: "isnet_fp16",
+	device: "gpu",
+	proxyToWorker: false,
+	debug: false,
+	output: {
+		format: "image/png",
+		quality: 1,
+	},
+};
+
+/*
+ * CPU/WASM fallback.
+ *
+ * This is intentionally a separate configuration because some browsers
+ * can report GPU support but still fail during WebGPU/FP16 initialization.
+ */
+const AI_FALLBACK_CONFIG = {
+	model: "isnet_fp16",
+	device: "cpu",
+	proxyToWorker: false,
+	debug: false,
+	output: {
+		format: "image/png",
+		quality: 1,
+	},
+};
+
+/* ---------------------------------------------------------------------- */
 /* ZIP HELPERS                                                            */
 /* ---------------------------------------------------------------------- */
 
@@ -74,7 +128,6 @@ function u32(n) {
 
 function concatBytes(chunks) {
 	const total = chunks.reduce((s, c) => s + c.length, 0);
-
 	const out = new Uint8Array(total);
 
 	let off = 0;
@@ -129,7 +182,6 @@ function buildZip(entries) {
 			u16(20),
 			u16(20),
 			u16(0),
-			u16(0),
 			u16(time),
 			u16(date),
 			u32(crc),
@@ -167,7 +219,7 @@ function buildZip(entries) {
 }
 
 /* ---------------------------------------------------------------------- */
-/* HELPERS                                                                */
+/* GENERAL HELPERS                                                        */
 /* ---------------------------------------------------------------------- */
 
 function formatBytes(bytes) {
@@ -188,7 +240,6 @@ function formatBytes(bytes) {
 
 function stripExt(name) {
 	const i = name.lastIndexOf(".");
-
 	return i > 0 ? name.slice(0, i) : name;
 }
 
@@ -202,7 +253,9 @@ function loadImageEl(src, crossOrigin) {
 
 		img.onload = () => resolve(img);
 
-		img.onerror = () => reject(new Error("Couldn't load image."));
+		img.onerror = () => {
+			reject(new Error("Couldn't load image."));
+		};
 
 		img.src = src;
 	});
@@ -217,9 +270,7 @@ function downloadBlob(blob, filename) {
 	a.download = filename;
 
 	document.body.appendChild(a);
-
 	a.click();
-
 	a.remove();
 
 	setTimeout(() => {
@@ -228,13 +279,9 @@ function downloadBlob(blob, filename) {
 }
 
 /* ---------------------------------------------------------------------- */
-/* BROWSER YIELD                                                         */
+/* BROWSER YIELD                                                          */
 /* ---------------------------------------------------------------------- */
 
-/*
- * Allows the browser to repaint and respond to user interaction
- * between heavy operations.
- */
 function yieldToBrowser() {
 	return new Promise((resolve) => {
 		if (typeof requestIdleCallback === "function") {
@@ -248,120 +295,27 @@ function yieldToBrowser() {
 }
 
 /* ---------------------------------------------------------------------- */
-/* IMAGE LIMITS                                                           */
+/* CANVAS -> BLOB                                                         */
 /* ---------------------------------------------------------------------- */
 
-/*
- * Maximum dimensions used for normal image processing.
- */
-const MAX_WORK_DIM = 2500;
-
-/*
- * Maximum AI inference dimension.
- *
- * Sending a 5000px / 6000px / 8000px image directly to the
- * segmentation model can consume a huge amount of browser memory.
- */
-const AI_MAX_DIMENSION = 2048;
-
-/*
- * Final output target.
- */
-const MAX_OUTPUT_BYTES = 1024 * 1024;
-
-/*
- * Minimum JPEG quality.
- */
-const MIN_JPEG_QUALITY = 0.45;
-
-/* ---------------------------------------------------------------------- */
-/* AI BACKGROUND REMOVAL                                                  */
-/* ---------------------------------------------------------------------- */
-
-let backgroundRemovalReady = false;
-
-/*
- * We intentionally do NOT call preload().
- *
- * The model will be loaded only when the first background-removal
- * operation actually starts.
- */
-let backgroundRemovalLoading = null;
-
-/*
- * Primary configuration.
- *
- * WebGPU is used when available.
- */
-const AI_PRIMARY_CONFIG = {
-	model: "isnet_fp16",
-
-	/*
-	 * Changed dynamically if WebGPU isn't supported.
-	 */
-	device: "gpu",
-
-	/*
-	 * Let the library use a worker where supported.
-	 */
-	proxyToWorker: true,
-
-	output: {
-		format: "image/png",
-		type: "foreground",
-		quality: 1,
-	},
-};
-
-/*
- * Smaller fallback model.
- *
- * This is important for browsers where fp16/WebGPU
- * produces the B.Gb null runtime error.
- */
-const AI_FALLBACK_CONFIG = {
-	model: "isnet_quint8",
-	device: "cpu",
-
-	proxyToWorker: true,
-
-	output: {
-		format: "image/png",
-		type: "foreground",
-		quality: 1,
-	},
-};
-
-function supportsWebGPU() {
-	return typeof navigator !== "undefined" && !!navigator.gpu;
-}
-
-function getAIConfig() {
-	if (supportsWebGPU()) {
-		return AI_PRIMARY_CONFIG;
-	}
-
-	return {
-		...AI_PRIMARY_CONFIG,
-		device: "cpu",
-	};
-}
-
-/*
- * No eager model preload.
- */
-async function prepareBackgroundRemoval() {
-	if (backgroundRemovalReady) {
-		return;
-	}
-
-	if (!backgroundRemovalLoading) {
-		backgroundRemovalLoading = Promise.resolve().then(() => {
-			backgroundRemovalReady = true;
-		});
-	}
-
-	await backgroundRemovalLoading;
+function canvasToBlob(canvas, mime, quality) {
+	return new Promise((resolve, reject) => {
+		try {
+			canvas.toBlob(
+				(blob) => {
+					if (blob) {
+						resolve(blob);
+					} else {
+						reject(new Error("Image encoding failed."));
+					}
+				},
+				mime,
+				quality,
+			);
+		} catch (error) {
+			reject(error);
+		}
+	});
 }
 
 /* ---------------------------------------------------------------------- */
@@ -372,8 +326,11 @@ async function prepareAIInput(src) {
 	const img = await loadImageEl(src);
 
 	const originalWidth = img.naturalWidth;
-
 	const originalHeight = img.naturalHeight;
+
+	if (!originalWidth || !originalHeight) {
+		throw new Error("Invalid image dimensions.");
+	}
 
 	const maxSide = Math.max(originalWidth, originalHeight);
 
@@ -384,7 +341,10 @@ async function prepareAIInput(src) {
 	const height = Math.max(1, Math.round(originalHeight * scale));
 
 	/*
-	 * Already small enough.
+	 * Image already small enough.
+	 *
+	 * Keep the original source so we don't introduce an unnecessary
+	 * resize before segmentation.
 	 */
 	if (width === originalWidth && height === originalHeight) {
 		return {
@@ -413,13 +373,22 @@ async function prepareAIInput(src) {
 	ctx.imageSmoothingEnabled = true;
 	ctx.imageSmoothingQuality = "high";
 
+	/*
+	 * White background is deliberately NOT added here.
+	 * The model should receive the original pixels.
+	 */
+	ctx.clearRect(0, 0, width, height);
+
 	ctx.drawImage(img, 0, 0, width, height);
 
-	const blob = await canvasToBlob(canvas, "image/jpeg", 0.92);
-
 	/*
-	 * Release canvas backing memory.
+	 * PNG is used for the resized AI input.
+	 *
+	 * JPEG compression can destroy fine hair/fur/object edges before
+	 * segmentation, which directly hurts mask quality.
 	 */
+	const blob = await canvasToBlob(canvas, "image/png", 1);
+
 	canvas.width = 1;
 	canvas.height = 1;
 
@@ -435,33 +404,27 @@ async function prepareAIInput(src) {
 }
 
 /* ---------------------------------------------------------------------- */
-/* REMOVE BACKGROUND                                                      */
+/* BACKGROUND REMOVAL                                                     */
 /* ---------------------------------------------------------------------- */
 
 async function removeBackgroundAI(src) {
-	await prepareBackgroundRemoval();
-
 	const aiInput = await prepareAIInput(src);
 
 	try {
-		const input = aiInput.blob || src;
+		console.log("[BG] Starting background removal:", {
+			model: AI_CONFIG.model,
+			device: AI_CONFIG.device,
+			width: aiInput.width,
+			height: aiInput.height,
+		});
 
 		/*
-		 * ---------------------------------------------------------------
-		 * FIRST ATTEMPT
-		 * ---------------------------------------------------------------
+		 * First attempt:
+		 *
+		 * WebGPU + FP16.
 		 */
 		try {
-			const config = getAIConfig();
-
-			console.log("[BG] Starting AI background removal:", {
-				model: config.model,
-				device: config.device,
-				width: aiInput.width,
-				height: aiInput.height,
-			});
-
-			const result = await aiRemoveBackground(input, config);
+			const result = await aiRemoveBackground(aiInput.blob || src, AI_CONFIG);
 
 			if (!(result instanceof Blob)) {
 				throw new Error("Background removal returned an invalid image.");
@@ -470,22 +433,18 @@ async function removeBackgroundAI(src) {
 			return result;
 		} catch (primaryError) {
 			console.warn(
-				"[BG] Primary model failed. Using fallback model.",
+				"[BG] WebGPU/FP16 failed. Retrying with CPU/WASM.",
 				primaryError,
 			);
 
 			/*
-			 * -------------------------------------------------------------
-			 * FALLBACK
-			 * -------------------------------------------------------------
+			 * Important:
 			 *
-			 * Handles browser/WebGPU/FP16 failures such as:
-			 *
-			 * TypeError:
-			 * can't access property "hc", B.Gb is null
+			 * We do NOT switch to quint8 here because the goal is better
+			 * edge quality. quint8 can introduce segmentation artifacts.
 			 */
 			const fallbackResult = await aiRemoveBackground(
-				input,
+				aiInput.blob || src,
 				AI_FALLBACK_CONFIG,
 			);
 
@@ -496,9 +455,6 @@ async function removeBackgroundAI(src) {
 			return fallbackResult;
 		}
 	} finally {
-		/*
-		 * Release temporary resized image.
-		 */
 		if (aiInput.temporary && aiInput.src) {
 			URL.revokeObjectURL(aiInput.src);
 		}
@@ -508,7 +464,7 @@ async function removeBackgroundAI(src) {
 }
 
 /* ---------------------------------------------------------------------- */
-/* CANVAS HELPERS                                                         */
+/* DRAW ENHANCED IMAGE                                                    */
 /* ---------------------------------------------------------------------- */
 
 function drawEnhancedImage(
@@ -538,9 +494,12 @@ function drawEnhancedImage(
 	}
 
 	/*
-	 * Subtle enhancement.
+	 * Only apply enhancement to normal image output.
+	 *
+	 * For transparent AI cutouts, aggressive enhancement can alter
+	 * semi-transparent edge pixels and create halos.
 	 */
-	if (enhance) {
+	if (enhance && !transparent) {
 		ctx.filter = "contrast(1.045) saturate(1.025) brightness(1.005)";
 	}
 
@@ -549,13 +508,11 @@ function drawEnhancedImage(
 	ctx.filter = "none";
 
 	/*
-	 * Mild sharpening only for normal images.
+	 * Very mild sharpening for normal images.
 	 */
 	if (enhance && !transparent) {
 		ctx.globalAlpha = 0.08;
-
 		ctx.globalCompositeOperation = "source-over";
-
 		ctx.filter = "contrast(1.08)";
 
 		ctx.drawImage(img, 0, 0, width, height);
@@ -565,30 +522,6 @@ function drawEnhancedImage(
 	}
 
 	return canvas;
-}
-
-/* ---------------------------------------------------------------------- */
-/* CANVAS -> BLOB                                                         */
-/* ---------------------------------------------------------------------- */
-
-function canvasToBlob(canvas, mime, quality) {
-	return new Promise((resolve, reject) => {
-		try {
-			canvas.toBlob(
-				(blob) => {
-					if (blob) {
-						resolve(blob);
-					} else {
-						reject(new Error("Image encoding failed."));
-					}
-				},
-				mime,
-				quality,
-			);
-		} catch (error) {
-			reject(error);
-		}
-	});
 }
 
 /* ---------------------------------------------------------------------- */
@@ -605,9 +538,6 @@ async function encodeJpegUnderLimit(img, width, height, quality, enhance) {
 	let bestWidth = width;
 	let bestHeight = height;
 
-	/*
-	 * Maximum 7 encodes instead of 12.
-	 */
 	for (let attempt = 0; attempt < 7; attempt++) {
 		const canvas = drawEnhancedImage(img, currentWidth, currentHeight, {
 			enhance,
@@ -616,9 +546,6 @@ async function encodeJpegUnderLimit(img, width, height, quality, enhance) {
 
 		const blob = await canvasToBlob(canvas, "image/jpeg", currentQuality);
 
-		/*
-		 * Release canvas memory.
-		 */
 		canvas.width = 1;
 		canvas.height = 1;
 
@@ -640,7 +567,7 @@ async function encodeJpegUnderLimit(img, width, height, quality, enhance) {
 		await yieldToBrowser();
 
 		/*
-		 * Reduce quality first.
+		 * Reduce JPEG quality first.
 		 */
 		if (currentQuality > MIN_JPEG_QUALITY) {
 			currentQuality = Math.max(MIN_JPEG_QUALITY, currentQuality - 0.1);
@@ -649,7 +576,7 @@ async function encodeJpegUnderLimit(img, width, height, quality, enhance) {
 		}
 
 		/*
-		 * Then reduce dimensions.
+		 * If quality is already low, reduce dimensions.
 		 */
 		currentWidth = Math.max(320, Math.round(currentWidth * 0.82));
 
@@ -679,19 +606,18 @@ async function encodePngUnderLimit(img, width, height, enhance) {
 	let bestHeight = height;
 
 	/*
-	 * Five attempts instead of 14.
+	 * PNG does not have a quality setting that reliably reduces file size.
+	 *
+	 * Therefore dimensions are progressively reduced.
 	 */
-	for (let attempt = 0; attempt < 5; attempt++) {
+	for (let attempt = 0; attempt < 6; attempt++) {
 		const canvas = drawEnhancedImage(img, currentWidth, currentHeight, {
-			enhance,
+			enhance: false,
 			transparent: true,
 		});
 
 		const blob = await canvasToBlob(canvas, "image/png", 1);
 
-		/*
-		 * Release canvas memory.
-		 */
 		canvas.width = 1;
 		canvas.height = 1;
 
@@ -713,9 +639,10 @@ async function encodePngUnderLimit(img, width, height, enhance) {
 		await yieldToBrowser();
 
 		/*
-		 * Reduce dimensions.
+		 * First reduction is moderate.
+		 * Later reductions are stronger.
 		 */
-		const scale = attempt === 0 ? 0.82 : 0.75;
+		const scale = attempt === 0 ? 0.88 : 0.78;
 
 		currentWidth = Math.max(320, Math.round(currentWidth * scale));
 
@@ -743,6 +670,10 @@ async function processImage(item, settings) {
 	let w = img.naturalWidth;
 	let h = img.naturalHeight;
 
+	if (!w || !h) {
+		throw new Error("Invalid image dimensions.");
+	}
+
 	const cap = settings.optimize
 		? Math.min(settings.maxDimension, MAX_WORK_DIM)
 		: MAX_WORK_DIM;
@@ -754,19 +685,11 @@ async function processImage(item, settings) {
 	h = Math.max(1, Math.round(h * scale));
 
 	/* ------------------------------------------------------------------ */
-	/* AI BACKGROUND REMOVAL                                              */
+	/* AI BACKGROUND REMOVAL                                               */
 	/* ------------------------------------------------------------------ */
 
 	if (settings.removeBg) {
 		try {
-			/*
-			 * The function internally:
-			 *
-			 * 1. Resizes the input to max 2048px for AI
-			 * 2. Runs GPU/fp16 where possible
-			 * 3. Falls back to quint8 CPU if necessary
-			 * 4. Releases temporary memory
-			 */
 			const aiBlob = await removeBackgroundAI(item.workingSrc);
 
 			if (!(aiBlob instanceof Blob)) {
@@ -779,8 +702,11 @@ async function processImage(item, settings) {
 				const transparentImg = await loadImageEl(aiUrl);
 
 				/*
-				 * If nothing else is enabled,
-				 * return the AI result directly.
+				 * If background removal is the only operation,
+				 * preserve the AI output exactly.
+				 *
+				 * This avoids unnecessary re-rendering and prevents
+				 * additional edge degradation.
 				 */
 				if (!settings.optimize && !settings.enhance) {
 					return {
@@ -792,7 +718,7 @@ async function processImage(item, settings) {
 				}
 
 				/*
-				 * Final output dimensions.
+				 * Determine final output dimensions.
 				 */
 				let outputWidth = transparentImg.naturalWidth;
 
@@ -812,13 +738,13 @@ async function processImage(item, settings) {
 				}
 
 				/*
-				 * Transparent image remains PNG.
+				 * Transparent images must remain PNG.
 				 */
 				return await encodePngUnderLimit(
 					transparentImg,
 					outputWidth,
 					outputHeight,
-					settings.enhance,
+					false,
 				);
 			} finally {
 				URL.revokeObjectURL(aiUrl);
@@ -836,7 +762,7 @@ async function processImage(item, settings) {
 	}
 
 	/* ------------------------------------------------------------------ */
-	/* NORMAL IMAGE OPTIMIZATION                                          */
+	/* NORMAL IMAGE OPTIMIZATION                                           */
 	/* ------------------------------------------------------------------ */
 
 	if (settings.optimize || settings.enhance) {
@@ -986,7 +912,7 @@ export default function ImageGrabberOptimizer() {
 				u.pathname.split("/").filter(Boolean).pop() || "image",
 			);
 		} catch {
-			// keep default
+			// Keep default.
 		}
 
 		const id = nextId++;
@@ -1041,7 +967,7 @@ export default function ImageGrabberOptimizer() {
 			);
 		} catch {
 			/*
-			 * Fall back to direct image loading.
+			 * Direct image fallback.
 			 */
 			setItems((prev) =>
 				prev.map((it) =>
@@ -1136,7 +1062,7 @@ export default function ImageGrabberOptimizer() {
 	);
 
 	/* ------------------------------------------------------------------ */
-	/* PROCESS - SEQUENTIAL QUEUE                                          */
+	/* PROCESS SEQUENTIAL QUEUE                                            */
 	/* ------------------------------------------------------------------ */
 
 	const handleProcess = useCallback(async () => {
@@ -1155,7 +1081,6 @@ export default function ImageGrabberOptimizer() {
 		}
 
 		setProcessing(true);
-
 		setProcessingIndex(0);
 		setProcessingTotal(current.length);
 
@@ -1177,11 +1102,10 @@ export default function ImageGrabberOptimizer() {
 
 		try {
 			/*
-			 * IMPORTANT:
+			 * Sequential processing is intentional.
 			 *
-			 * ONE IMAGE AT A TIME.
-			 *
-			 * Do NOT use Promise.all().
+			 * Do NOT use Promise.all() here because multiple ONNX
+			 * sessions/images can consume several hundred MB of RAM.
 			 */
 			for (let index = 0; index < current.length; index++) {
 				const item = current[index];
@@ -1199,9 +1123,6 @@ export default function ImageGrabberOptimizer() {
 					),
 				);
 
-				/*
-				 * Allow React to render the processing state.
-				 */
 				await yieldToBrowser();
 
 				try {
@@ -1217,7 +1138,6 @@ export default function ImageGrabberOptimizer() {
 								? {
 										...it,
 										processStatus: "done",
-
 										processed: {
 											blob: result.blob,
 											url,
@@ -1239,7 +1159,6 @@ export default function ImageGrabberOptimizer() {
 								? {
 										...it,
 										processStatus: "error",
-
 										processError: err?.message || "Processing failed.",
 									}
 								: it,
@@ -1247,15 +1166,8 @@ export default function ImageGrabberOptimizer() {
 					);
 				}
 
-				/*
-				 * Give browser time to release memory
-				 * and repaint UI.
-				 */
 				await yieldToBrowser();
 
-				/*
-				 * Small gap between heavy jobs.
-				 */
 				await new Promise((resolve) => setTimeout(resolve, 50));
 			}
 		} finally {
@@ -1290,7 +1202,6 @@ export default function ImageGrabberOptimizer() {
 
 		(async () => {
 			const used = new Set();
-
 			const entries = [];
 
 			for (const it of done) {
@@ -1450,9 +1361,7 @@ export default function ImageGrabberOptimizer() {
 				onDrop={handleDrop}
 				style={{
 					border: `1.5px dashed ${isDragging ? colors.accent : colors.border}`,
-
 					background: isDragging ? colors.accentDim + "33" : colors.panel,
-
 					borderRadius: 12,
 				}}
 				className="p-8 flex flex-col items-center justify-center text-center transition-colors">
@@ -1517,7 +1426,6 @@ export default function ImageGrabberOptimizer() {
 						onKeyDown={(e) => {
 							if (e.key === "Enter" && urlInput.trim()) {
 								addUrl(urlInput);
-
 								setUrlInput("");
 							}
 						}}
@@ -1535,7 +1443,6 @@ export default function ImageGrabberOptimizer() {
 						onClick={() => {
 							if (urlInput.trim()) {
 								addUrl(urlInput);
-
 								setUrlInput("");
 							}
 						}}
@@ -1758,9 +1665,9 @@ export default function ImageGrabberOptimizer() {
 						style={{
 							color: colors.textDim,
 						}}>
-						AI background removal automatically limits inference resolution to
-						reduce browser memory usage. GPU acceleration is used when
-						available, with an automatic smaller-model fallback.
+						AI segmentation uses the higher-quality isnet_fp16 model at up to
+						2048px inference resolution. WebGPU is used when available, with
+						CPU/WASM fallback.
 					</p>
 				)}
 
@@ -1770,8 +1677,8 @@ export default function ImageGrabberOptimizer() {
 						style={{
 							color: colors.textDim,
 						}}>
-						Applies subtle clarity, contrast and sharpening while keeping the
-						output compressed to approximately 1 MB or less.
+						Applies subtle clarity, contrast and sharpening while keeping normal
+						image output close to the 1 MB target.
 					</p>
 				)}
 
