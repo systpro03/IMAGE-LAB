@@ -17,314 +17,157 @@ import {
 import { removeBackground as aiRemoveBackground } from "@imgly/background-removal";
 
 /* ---------------------------------------------------------------------- */
-/* CONSTANTS                                                              */
-/* ---------------------------------------------------------------------- */
-
-const MAX_OUTPUT_BYTES = 1024 * 1024;
-const MIN_JPEG_QUALITY = 0.45;
-
-/*
- * Maximum dimensions for normal image processing.
- */
-const MAX_WORK_DIM = 2500;
-
-/*
- * Maximum dimension sent to the segmentation model.
- *
- * 2048 gives substantially better edge detail than very small inference
- * sizes while preventing huge images from consuming excessive memory.
- */
-const AI_MAX_DIMENSION = 2048;
-
-/*
- * Primary model.
- *
- * isnet_fp16 provides a better quality/speed balance than the quantized
- * quint8 model.
- */
-const AI_CONFIG = {
-	model: "isnet_fp16",
-	device: "gpu",
-	proxyToWorker: false,
-	debug: false,
-	output: {
-		format: "image/png",
-		quality: 1,
-	},
-};
-
-/*
- * CPU/WASM fallback.
- *
- * This is intentionally a separate configuration because some browsers
- * can report GPU support but still fail during WebGPU/FP16 initialization.
- */
-const AI_FALLBACK_CONFIG = {
-	model: "isnet_fp16",
-	device: "cpu",
-	proxyToWorker: false,
-	debug: false,
-	output: {
-		format: "image/png",
-		quality: 1,
-	},
-};
-
-/* ---------------------------------------------------------------------- */
 /* ZIP HELPERS                                                            */
 /* ---------------------------------------------------------------------- */
 
 const CRC_TABLE = (() => {
-  const table = new Uint32Array(256);
+	const table = new Uint32Array(256);
 
-  for (let n = 0; n < 256; n++) {
-    let c = n;
+	for (let n = 0; n < 256; n++) {
+		let c = n;
 
-    for (let k = 0; k < 8; k++) {
-      c = (c & 1)
-        ? 0xedb88320 ^ (c >>> 1)
-        : c >>> 1;
-    }
+		for (let k = 0; k < 8; k++) {
+			c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+		}
 
-    table[n] = c >>> 0;
-  }
+		table[n] = c >>> 0;
+	}
 
-  return table;
+	return table;
 })();
 
 function crc32(bytes) {
-  let crc = 0xffffffff;
+	let crc = 0xffffffff;
 
-  for (let i = 0; i < bytes.length; i++) {
-    crc = CRC_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
-  }
+	for (let i = 0; i < bytes.length; i++) {
+		crc = CRC_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+	}
 
-  return (crc ^ 0xffffffff) >>> 0;
+	return (crc ^ 0xffffffff) >>> 0;
 }
 
-function writeU16(value) {
-  const out = new Uint8Array(2);
-  const view = new DataView(out.buffer);
+function dosDateTime(d) {
+	const date =
+		((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
 
-  view.setUint16(0, value >>> 0, true);
+	const time =
+		(d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
 
-  return out;
+	return {
+		date,
+		time,
+	};
 }
 
-function writeU32(value) {
-  const out = new Uint8Array(4);
-  const view = new DataView(out.buffer);
+function u16(n) {
+	return new Uint8Array([n & 0xff, (n >> 8) & 0xff]);
+}
 
-  view.setUint32(0, value >>> 0, true);
-
-  return out;
+function u32(n) {
+	return new Uint8Array([
+		n & 0xff,
+		(n >> 8) & 0xff,
+		(n >> 16) & 0xff,
+		(n >> 24) & 0xff,
+	]);
 }
 
 function concatBytes(chunks) {
-  const total = chunks.reduce(
-    (sum, chunk) => sum + chunk.length,
-    0
-  );
+	const total = chunks.reduce((s, c) => s + c.length, 0);
 
-  const result = new Uint8Array(total);
+	const out = new Uint8Array(total);
 
-  let offset = 0;
+	let off = 0;
 
-  for (const chunk of chunks) {
-    result.set(chunk, offset);
-    offset += chunk.length;
-  }
+	for (const c of chunks) {
+		out.set(c, off);
+		off += c.length;
+	}
 
-  return result;
+	return out;
 }
 
-function strBytes(str) {
-  return new TextEncoder().encode(str);
+function strBytes(s) {
+	return new TextEncoder().encode(s);
 }
 
-function dosDateTime(date) {
-  const year = Math.max(
-    1980,
-    Math.min(2107, date.getFullYear())
-  );
-
-  const dosDate =
-    ((year - 1980) << 9) |
-    ((date.getMonth() + 1) << 5) |
-    date.getDate();
-
-  const dosTime =
-    (date.getHours() << 11) |
-    (date.getMinutes() << 5) |
-    Math.floor(date.getSeconds() / 2);
-
-  return {
-    date: dosDate & 0xffff,
-    time: dosTime & 0xffff,
-  };
-}
-
-/**
- * Creates a standards-compliant ZIP archive.
- *
- * Important:
- * - Uses STORE compression (method 0)
- * - Uses UTF-8 filename flag
- * - Writes valid local file headers
- * - Writes valid central directory headers
- * - Writes valid EOCD record
- * - Does not use data descriptors
- * - Does not use ZIP64
- */
 function buildZip(entries) {
-  if (!Array.isArray(entries) || entries.length === 0) {
-    throw new Error("Cannot create an empty ZIP archive.");
-  }
+	const { date, time } = dosDateTime(new Date());
 
-  if (entries.length > 0xffff) {
-    throw new Error("Too many files for a standard ZIP archive.");
-  }
+	const localChunks = [];
+	const centralChunks = [];
 
-  const now = new Date();
-  const { date, time } = dosDateTime(now);
+	let offset = 0;
 
-  const localParts = [];
-  const centralParts = [];
+	for (const entry of entries) {
+		const nameBytes = strBytes(entry.name);
+		const data = entry.data;
 
-  let localOffset = 0;
+		const crc = crc32(data);
+		const size = data.length;
 
-  for (const entry of entries) {
-    if (!entry || typeof entry.name !== "string") {
-      throw new Error("Invalid ZIP entry name.");
-    }
+		const local = concatBytes([
+			u32(0x04034b50),
+			u16(20),
+			u16(0),
+			u16(0),
+			u16(time),
+			u16(date),
+			u32(crc),
+			u32(size),
+			u32(size),
+			u16(nameBytes.length),
+			u16(0),
+			nameBytes,
+			data,
+		]);
 
-    if (!(entry.data instanceof Uint8Array)) {
-      throw new Error(`Invalid ZIP data for "${entry.name}".`);
-    }
+		localChunks.push(local);
 
-    const nameBytes = strBytes(entry.name);
-    const data = entry.data;
+		const central = concatBytes([
+			u32(0x02014b50),
+			u16(20),
+			u16(20),
+			u16(0),
+			u16(0),
+			u16(time),
+			u16(date),
+			u32(crc),
+			u32(size),
+			u32(size),
+			u16(nameBytes.length),
+			u16(0),
+			u16(0),
+			u16(0),
+			u16(0),
+			u32(0),
+			u32(offset),
+			nameBytes,
+		]);
 
-    if (nameBytes.length > 0xffff) {
-      throw new Error(`ZIP filename is too long: ${entry.name}`);
-    }
+		centralChunks.push(central);
 
-    if (data.length > 0xffffffff) {
-      throw new Error(`File is too large for standard ZIP: ${entry.name}`);
-    }
+		offset += local.length;
+	}
 
-    if (localOffset > 0xffffffff) {
-      throw new Error("ZIP archive is too large for standard ZIP.");
-    }
+	const centralDir = concatBytes(centralChunks);
 
-    const crc = crc32(data);
+	const end = concatBytes([
+		u32(0x06054b50),
+		u16(0),
+		u16(0),
+		u16(entries.length),
+		u16(entries.length),
+		u32(centralDir.length),
+		u32(offset),
+		u16(0),
+	]);
 
-    /*
-     * General purpose bit flag:
-     *
-     * Bit 11 = UTF-8 filename
-     */
-    const flags = 0x0800;
-
-    /*
-     * Compression method:
-     *
-     * 0 = STORE / no compression
-     */
-    const compressionMethod = 0;
-
-    /* --------------------------------------------------------------- */
-    /* LOCAL FILE HEADER                                                */
-    /* --------------------------------------------------------------- */
-
-    const localHeader = concatBytes([
-      writeU32(0x04034b50), // Local file header signature
-      writeU16(20),         // Version needed to extract
-      writeU16(flags),      // General purpose bit flag
-      writeU16(compressionMethod),
-      writeU16(time),
-      writeU16(date),
-      writeU32(crc),
-      writeU32(data.length),
-      writeU32(data.length),
-      writeU16(nameBytes.length),
-      writeU16(0),         // Extra field length
-      nameBytes,
-    ]);
-
-    localParts.push(localHeader);
-    localParts.push(data);
-
-    /* --------------------------------------------------------------- */
-    /* CENTRAL DIRECTORY HEADER                                         */
-    /* --------------------------------------------------------------- */
-
-    const centralHeader = concatBytes([
-      writeU32(0x02014b50), // Central directory signature
-
-      writeU16(20),         // Version made by
-      writeU16(20),         // Version needed to extract
-
-      writeU16(flags),
-      writeU16(compressionMethod),
-
-      writeU16(time),
-      writeU16(date),
-
-      writeU32(crc),
-
-      writeU32(data.length),
-      writeU32(data.length),
-
-      writeU16(nameBytes.length),
-      writeU16(0),          // Extra field length
-      writeU16(0),          // Comment length
-
-      writeU16(0),          // Disk number start
-      writeU16(0),          // Internal attributes
-      writeU32(0),          // External attributes
-
-      writeU32(localOffset),
-
-      nameBytes,
-    ]);
-
-    centralParts.push(centralHeader);
-
-    localOffset += localHeader.length + data.length;
-  }
-
-  const localDirectory = concatBytes(localParts);
-  const centralDirectory = concatBytes(centralParts);
-
-  /* --------------------------------------------------------------- */
-  /* END OF CENTRAL DIRECTORY                                         */
-  /* --------------------------------------------------------------- */
-
-  const endOfCentralDirectory = concatBytes([
-    writeU32(0x06054b50),
-
-    writeU16(0), // Disk number
-    writeU16(0), // Disk containing central directory
-
-    writeU16(entries.length),
-    writeU16(entries.length),
-
-    writeU32(centralDirectory.length),
-    writeU32(localDirectory.length),
-
-    writeU16(0), // ZIP comment length
-  ]);
-
-  return concatBytes([
-    localDirectory,
-    centralDirectory,
-    endOfCentralDirectory,
-  ]);
+	return concatBytes([...localChunks, centralDir, end]);
 }
 
 /* ---------------------------------------------------------------------- */
-/* GENERAL HELPERS                                                        */
+/* HELPERS                                                                */
 /* ---------------------------------------------------------------------- */
 
 function formatBytes(bytes) {
@@ -345,6 +188,7 @@ function formatBytes(bytes) {
 
 function stripExt(name) {
 	const i = name.lastIndexOf(".");
+
 	return i > 0 ? name.slice(0, i) : name;
 }
 
@@ -358,9 +202,7 @@ function loadImageEl(src, crossOrigin) {
 
 		img.onload = () => resolve(img);
 
-		img.onerror = () => {
-			reject(new Error("Couldn't load image."));
-		};
+		img.onerror = () => reject(new Error("Couldn't load image."));
 
 		img.src = src;
 	});
@@ -375,7 +217,9 @@ function downloadBlob(blob, filename) {
 	a.download = filename;
 
 	document.body.appendChild(a);
+
 	a.click();
+
 	a.remove();
 
 	setTimeout(() => {
@@ -384,9 +228,13 @@ function downloadBlob(blob, filename) {
 }
 
 /* ---------------------------------------------------------------------- */
-/* BROWSER YIELD                                                          */
+/* BROWSER YIELD                                                         */
 /* ---------------------------------------------------------------------- */
 
+/*
+ * Allows the browser to repaint and respond to user interaction
+ * between heavy operations.
+ */
 function yieldToBrowser() {
 	return new Promise((resolve) => {
 		if (typeof requestIdleCallback === "function") {
@@ -400,27 +248,120 @@ function yieldToBrowser() {
 }
 
 /* ---------------------------------------------------------------------- */
-/* CANVAS -> BLOB                                                         */
+/* IMAGE LIMITS                                                           */
 /* ---------------------------------------------------------------------- */
 
-function canvasToBlob(canvas, mime, quality) {
-	return new Promise((resolve, reject) => {
-		try {
-			canvas.toBlob(
-				(blob) => {
-					if (blob) {
-						resolve(blob);
-					} else {
-						reject(new Error("Image encoding failed."));
-					}
-				},
-				mime,
-				quality,
-			);
-		} catch (error) {
-			reject(error);
-		}
-	});
+/*
+ * Maximum dimensions used for normal image processing.
+ */
+const MAX_WORK_DIM = 2500;
+
+/*
+ * Maximum AI inference dimension.
+ *
+ * Sending a 5000px / 6000px / 8000px image directly to the
+ * segmentation model can consume a huge amount of browser memory.
+ */
+const AI_MAX_DIMENSION = 2048;
+
+/*
+ * Final output target.
+ */
+const MAX_OUTPUT_BYTES = 1024 * 1024;
+
+/*
+ * Minimum JPEG quality.
+ */
+const MIN_JPEG_QUALITY = 0.45;
+
+/* ---------------------------------------------------------------------- */
+/* AI BACKGROUND REMOVAL                                                  */
+/* ---------------------------------------------------------------------- */
+
+let backgroundRemovalReady = false;
+
+/*
+ * We intentionally do NOT call preload().
+ *
+ * The model will be loaded only when the first background-removal
+ * operation actually starts.
+ */
+let backgroundRemovalLoading = null;
+
+/*
+ * Primary configuration.
+ *
+ * WebGPU is used when available.
+ */
+const AI_PRIMARY_CONFIG = {
+	model: "isnet_fp16",
+
+	/*
+	 * Changed dynamically if WebGPU isn't supported.
+	 */
+	device: "gpu",
+
+	/*
+	 * Let the library use a worker where supported.
+	 */
+	proxyToWorker: true,
+
+	output: {
+		format: "image/png",
+		type: "foreground",
+		quality: 1,
+	},
+};
+
+/*
+ * Smaller fallback model.
+ *
+ * This is important for browsers where fp16/WebGPU
+ * produces the B.Gb null runtime error.
+ */
+const AI_FALLBACK_CONFIG = {
+	model: "isnet_quint8",
+	device: "cpu",
+
+	proxyToWorker: true,
+
+	output: {
+		format: "image/png",
+		type: "foreground",
+		quality: 1,
+	},
+};
+
+function supportsWebGPU() {
+	return typeof navigator !== "undefined" && !!navigator.gpu;
+}
+
+function getAIConfig() {
+	if (supportsWebGPU()) {
+		return AI_PRIMARY_CONFIG;
+	}
+
+	return {
+		...AI_PRIMARY_CONFIG,
+		device: "cpu",
+	};
+}
+
+/*
+ * No eager model preload.
+ */
+async function prepareBackgroundRemoval() {
+	if (backgroundRemovalReady) {
+		return;
+	}
+
+	if (!backgroundRemovalLoading) {
+		backgroundRemovalLoading = Promise.resolve().then(() => {
+			backgroundRemovalReady = true;
+		});
+	}
+
+	await backgroundRemovalLoading;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -431,11 +372,8 @@ async function prepareAIInput(src) {
 	const img = await loadImageEl(src);
 
 	const originalWidth = img.naturalWidth;
-	const originalHeight = img.naturalHeight;
 
-	if (!originalWidth || !originalHeight) {
-		throw new Error("Invalid image dimensions.");
-	}
+	const originalHeight = img.naturalHeight;
 
 	const maxSide = Math.max(originalWidth, originalHeight);
 
@@ -446,10 +384,7 @@ async function prepareAIInput(src) {
 	const height = Math.max(1, Math.round(originalHeight * scale));
 
 	/*
-	 * Image already small enough.
-	 *
-	 * Keep the original source so we don't introduce an unnecessary
-	 * resize before segmentation.
+	 * Already small enough.
 	 */
 	if (width === originalWidth && height === originalHeight) {
 		return {
@@ -478,22 +413,13 @@ async function prepareAIInput(src) {
 	ctx.imageSmoothingEnabled = true;
 	ctx.imageSmoothingQuality = "high";
 
-	/*
-	 * White background is deliberately NOT added here.
-	 * The model should receive the original pixels.
-	 */
-	ctx.clearRect(0, 0, width, height);
-
 	ctx.drawImage(img, 0, 0, width, height);
 
-	/*
-	 * PNG is used for the resized AI input.
-	 *
-	 * JPEG compression can destroy fine hair/fur/object edges before
-	 * segmentation, which directly hurts mask quality.
-	 */
-	const blob = await canvasToBlob(canvas, "image/png", 1);
+	const blob = await canvasToBlob(canvas, "image/jpeg", 0.92);
 
+	/*
+	 * Release canvas backing memory.
+	 */
 	canvas.width = 1;
 	canvas.height = 1;
 
@@ -509,27 +435,33 @@ async function prepareAIInput(src) {
 }
 
 /* ---------------------------------------------------------------------- */
-/* BACKGROUND REMOVAL                                                     */
+/* REMOVE BACKGROUND                                                      */
 /* ---------------------------------------------------------------------- */
 
 async function removeBackgroundAI(src) {
+	await prepareBackgroundRemoval();
+
 	const aiInput = await prepareAIInput(src);
 
 	try {
-		console.log("[BG] Starting background removal:", {
-			model: AI_CONFIG.model,
-			device: AI_CONFIG.device,
-			width: aiInput.width,
-			height: aiInput.height,
-		});
+		const input = aiInput.blob || src;
 
 		/*
-		 * First attempt:
-		 *
-		 * WebGPU + FP16.
+		 * ---------------------------------------------------------------
+		 * FIRST ATTEMPT
+		 * ---------------------------------------------------------------
 		 */
 		try {
-			const result = await aiRemoveBackground(aiInput.blob || src, AI_CONFIG);
+			const config = getAIConfig();
+
+			console.log("[BG] Starting AI background removal:", {
+				model: config.model,
+				device: config.device,
+				width: aiInput.width,
+				height: aiInput.height,
+			});
+
+			const result = await aiRemoveBackground(input, config);
 
 			if (!(result instanceof Blob)) {
 				throw new Error("Background removal returned an invalid image.");
@@ -538,18 +470,22 @@ async function removeBackgroundAI(src) {
 			return result;
 		} catch (primaryError) {
 			console.warn(
-				"[BG] WebGPU/FP16 failed. Retrying with CPU/WASM.",
+				"[BG] Primary model failed. Using fallback model.",
 				primaryError,
 			);
 
 			/*
-			 * Important:
+			 * -------------------------------------------------------------
+			 * FALLBACK
+			 * -------------------------------------------------------------
 			 *
-			 * We do NOT switch to quint8 here because the goal is better
-			 * edge quality. quint8 can introduce segmentation artifacts.
+			 * Handles browser/WebGPU/FP16 failures such as:
+			 *
+			 * TypeError:
+			 * can't access property "hc", B.Gb is null
 			 */
 			const fallbackResult = await aiRemoveBackground(
-				aiInput.blob || src,
+				input,
 				AI_FALLBACK_CONFIG,
 			);
 
@@ -560,6 +496,9 @@ async function removeBackgroundAI(src) {
 			return fallbackResult;
 		}
 	} finally {
+		/*
+		 * Release temporary resized image.
+		 */
 		if (aiInput.temporary && aiInput.src) {
 			URL.revokeObjectURL(aiInput.src);
 		}
@@ -569,7 +508,7 @@ async function removeBackgroundAI(src) {
 }
 
 /* ---------------------------------------------------------------------- */
-/* DRAW ENHANCED IMAGE                                                    */
+/* CANVAS HELPERS                                                         */
 /* ---------------------------------------------------------------------- */
 
 function drawEnhancedImage(
@@ -599,12 +538,9 @@ function drawEnhancedImage(
 	}
 
 	/*
-	 * Only apply enhancement to normal image output.
-	 *
-	 * For transparent AI cutouts, aggressive enhancement can alter
-	 * semi-transparent edge pixels and create halos.
+	 * Subtle enhancement.
 	 */
-	if (enhance && !transparent) {
+	if (enhance) {
 		ctx.filter = "contrast(1.045) saturate(1.025) brightness(1.005)";
 	}
 
@@ -613,11 +549,13 @@ function drawEnhancedImage(
 	ctx.filter = "none";
 
 	/*
-	 * Very mild sharpening for normal images.
+	 * Mild sharpening only for normal images.
 	 */
 	if (enhance && !transparent) {
 		ctx.globalAlpha = 0.08;
+
 		ctx.globalCompositeOperation = "source-over";
+
 		ctx.filter = "contrast(1.08)";
 
 		ctx.drawImage(img, 0, 0, width, height);
@@ -627,6 +565,30 @@ function drawEnhancedImage(
 	}
 
 	return canvas;
+}
+
+/* ---------------------------------------------------------------------- */
+/* CANVAS -> BLOB                                                         */
+/* ---------------------------------------------------------------------- */
+
+function canvasToBlob(canvas, mime, quality) {
+	return new Promise((resolve, reject) => {
+		try {
+			canvas.toBlob(
+				(blob) => {
+					if (blob) {
+						resolve(blob);
+					} else {
+						reject(new Error("Image encoding failed."));
+					}
+				},
+				mime,
+				quality,
+			);
+		} catch (error) {
+			reject(error);
+		}
+	});
 }
 
 /* ---------------------------------------------------------------------- */
@@ -643,6 +605,9 @@ async function encodeJpegUnderLimit(img, width, height, quality, enhance) {
 	let bestWidth = width;
 	let bestHeight = height;
 
+	/*
+	 * Maximum 7 encodes instead of 12.
+	 */
 	for (let attempt = 0; attempt < 7; attempt++) {
 		const canvas = drawEnhancedImage(img, currentWidth, currentHeight, {
 			enhance,
@@ -651,6 +616,9 @@ async function encodeJpegUnderLimit(img, width, height, quality, enhance) {
 
 		const blob = await canvasToBlob(canvas, "image/jpeg", currentQuality);
 
+		/*
+		 * Release canvas memory.
+		 */
 		canvas.width = 1;
 		canvas.height = 1;
 
@@ -672,7 +640,7 @@ async function encodeJpegUnderLimit(img, width, height, quality, enhance) {
 		await yieldToBrowser();
 
 		/*
-		 * Reduce JPEG quality first.
+		 * Reduce quality first.
 		 */
 		if (currentQuality > MIN_JPEG_QUALITY) {
 			currentQuality = Math.max(MIN_JPEG_QUALITY, currentQuality - 0.1);
@@ -681,7 +649,7 @@ async function encodeJpegUnderLimit(img, width, height, quality, enhance) {
 		}
 
 		/*
-		 * If quality is already low, reduce dimensions.
+		 * Then reduce dimensions.
 		 */
 		currentWidth = Math.max(320, Math.round(currentWidth * 0.82));
 
@@ -711,18 +679,19 @@ async function encodePngUnderLimit(img, width, height, enhance) {
 	let bestHeight = height;
 
 	/*
-	 * PNG does not have a quality setting that reliably reduces file size.
-	 *
-	 * Therefore dimensions are progressively reduced.
+	 * Five attempts instead of 14.
 	 */
-	for (let attempt = 0; attempt < 6; attempt++) {
+	for (let attempt = 0; attempt < 5; attempt++) {
 		const canvas = drawEnhancedImage(img, currentWidth, currentHeight, {
-			enhance: false,
+			enhance,
 			transparent: true,
 		});
 
 		const blob = await canvasToBlob(canvas, "image/png", 1);
 
+		/*
+		 * Release canvas memory.
+		 */
 		canvas.width = 1;
 		canvas.height = 1;
 
@@ -744,10 +713,9 @@ async function encodePngUnderLimit(img, width, height, enhance) {
 		await yieldToBrowser();
 
 		/*
-		 * First reduction is moderate.
-		 * Later reductions are stronger.
+		 * Reduce dimensions.
 		 */
-		const scale = attempt === 0 ? 0.88 : 0.78;
+		const scale = attempt === 0 ? 0.82 : 0.75;
 
 		currentWidth = Math.max(320, Math.round(currentWidth * scale));
 
@@ -775,10 +743,6 @@ async function processImage(item, settings) {
 	let w = img.naturalWidth;
 	let h = img.naturalHeight;
 
-	if (!w || !h) {
-		throw new Error("Invalid image dimensions.");
-	}
-
 	const cap = settings.optimize
 		? Math.min(settings.maxDimension, MAX_WORK_DIM)
 		: MAX_WORK_DIM;
@@ -790,11 +754,19 @@ async function processImage(item, settings) {
 	h = Math.max(1, Math.round(h * scale));
 
 	/* ------------------------------------------------------------------ */
-	/* AI BACKGROUND REMOVAL                                               */
+	/* AI BACKGROUND REMOVAL                                              */
 	/* ------------------------------------------------------------------ */
 
 	if (settings.removeBg) {
 		try {
+			/*
+			 * The function internally:
+			 *
+			 * 1. Resizes the input to max 2048px for AI
+			 * 2. Runs GPU/fp16 where possible
+			 * 3. Falls back to quint8 CPU if necessary
+			 * 4. Releases temporary memory
+			 */
 			const aiBlob = await removeBackgroundAI(item.workingSrc);
 
 			if (!(aiBlob instanceof Blob)) {
@@ -807,11 +779,8 @@ async function processImage(item, settings) {
 				const transparentImg = await loadImageEl(aiUrl);
 
 				/*
-				 * If background removal is the only operation,
-				 * preserve the AI output exactly.
-				 *
-				 * This avoids unnecessary re-rendering and prevents
-				 * additional edge degradation.
+				 * If nothing else is enabled,
+				 * return the AI result directly.
 				 */
 				if (!settings.optimize && !settings.enhance) {
 					return {
@@ -823,7 +792,7 @@ async function processImage(item, settings) {
 				}
 
 				/*
-				 * Determine final output dimensions.
+				 * Final output dimensions.
 				 */
 				let outputWidth = transparentImg.naturalWidth;
 
@@ -843,13 +812,13 @@ async function processImage(item, settings) {
 				}
 
 				/*
-				 * Transparent images must remain PNG.
+				 * Transparent image remains PNG.
 				 */
 				return await encodePngUnderLimit(
 					transparentImg,
 					outputWidth,
 					outputHeight,
-					false,
+					settings.enhance,
 				);
 			} finally {
 				URL.revokeObjectURL(aiUrl);
@@ -867,7 +836,7 @@ async function processImage(item, settings) {
 	}
 
 	/* ------------------------------------------------------------------ */
-	/* NORMAL IMAGE OPTIMIZATION                                           */
+	/* NORMAL IMAGE OPTIMIZATION                                          */
 	/* ------------------------------------------------------------------ */
 
 	if (settings.optimize || settings.enhance) {
@@ -1017,7 +986,7 @@ export default function ImageGrabberOptimizer() {
 				u.pathname.split("/").filter(Boolean).pop() || "image",
 			);
 		} catch {
-			// Keep default.
+			// keep default
 		}
 
 		const id = nextId++;
@@ -1072,7 +1041,7 @@ export default function ImageGrabberOptimizer() {
 			);
 		} catch {
 			/*
-			 * Direct image fallback.
+			 * Fall back to direct image loading.
 			 */
 			setItems((prev) =>
 				prev.map((it) =>
@@ -1167,7 +1136,7 @@ export default function ImageGrabberOptimizer() {
 	);
 
 	/* ------------------------------------------------------------------ */
-	/* PROCESS SEQUENTIAL QUEUE                                            */
+	/* PROCESS - SEQUENTIAL QUEUE                                          */
 	/* ------------------------------------------------------------------ */
 
 	const handleProcess = useCallback(async () => {
@@ -1186,6 +1155,7 @@ export default function ImageGrabberOptimizer() {
 		}
 
 		setProcessing(true);
+
 		setProcessingIndex(0);
 		setProcessingTotal(current.length);
 
@@ -1207,10 +1177,11 @@ export default function ImageGrabberOptimizer() {
 
 		try {
 			/*
-			 * Sequential processing is intentional.
+			 * IMPORTANT:
 			 *
-			 * Do NOT use Promise.all() here because multiple ONNX
-			 * sessions/images can consume several hundred MB of RAM.
+			 * ONE IMAGE AT A TIME.
+			 *
+			 * Do NOT use Promise.all().
 			 */
 			for (let index = 0; index < current.length; index++) {
 				const item = current[index];
@@ -1228,6 +1199,9 @@ export default function ImageGrabberOptimizer() {
 					),
 				);
 
+				/*
+				 * Allow React to render the processing state.
+				 */
 				await yieldToBrowser();
 
 				try {
@@ -1243,6 +1217,7 @@ export default function ImageGrabberOptimizer() {
 								? {
 										...it,
 										processStatus: "done",
+
 										processed: {
 											blob: result.blob,
 											url,
@@ -1264,6 +1239,7 @@ export default function ImageGrabberOptimizer() {
 								? {
 										...it,
 										processStatus: "error",
+
 										processError: err?.message || "Processing failed.",
 									}
 								: it,
@@ -1271,8 +1247,15 @@ export default function ImageGrabberOptimizer() {
 					);
 				}
 
+				/*
+				 * Give browser time to release memory
+				 * and repaint UI.
+				 */
 				await yieldToBrowser();
 
+				/*
+				 * Small gap between heavy jobs.
+				 */
 				await new Promise((resolve) => setTimeout(resolve, 50));
 			}
 		} finally {
@@ -1286,126 +1269,65 @@ export default function ImageGrabberOptimizer() {
 	/* DOWNLOAD                                                            */
 	/* ------------------------------------------------------------------ */
 
-const handleDownload = useCallback(() => {
-	const done = items.filter(
-		(it) =>
-			it.processStatus === "done" &&
-			it.processed &&
-			it.processed.blob instanceof Blob &&
-			it.processed.blob.size > 0,
-	);
+	const handleDownload = useCallback(() => {
+		const done = items.filter(
+			(it) => it.processStatus === "done" && it.processed,
+		);
 
-	if (!done.length) {
-		return;
-	}
+		if (!done.length) {
+			return;
+		}
 
-	/* --------------------------------------------------------------- */
-	/* SINGLE IMAGE                                                     */
-	/* --------------------------------------------------------------- */
+		if (done.length === 1) {
+			const it = done[0];
 
-	if (done.length === 1) {
-		const it = done[0];
+			const ext = it.processed.mime === "image/png" ? "png" : "jpg";
 
-		const ext = it.processed.mime === "image/png" ? "png" : "jpg";
+			downloadBlob(it.processed.blob, `${stripExt(it.name)}-optimized.${ext}`);
 
-		const filename = `${stripExt(it.name)}-optimized.${ext}`;
+			return;
+		}
 
-		downloadBlob(it.processed.blob, filename);
+		(async () => {
+			const used = new Set();
 
-		return;
-	}
-
-	/* --------------------------------------------------------------- */
-	/* MULTIPLE IMAGES -> ZIP                                          */
-	/* --------------------------------------------------------------- */
-
-	(async () => {
-		try {
-			const usedNames = new Set();
 			const entries = [];
 
 			for (const it of done) {
 				const ext = it.processed.mime === "image/png" ? "png" : "jpg";
 
-				const baseName = stripExt(it.name);
+				let name = `${stripExt(it.name)}-optimized.${ext}`;
 
-				let filename = `${baseName}-optimized.${ext}`;
+				let n = 2;
 
-				let counter = 2;
+				while (used.has(name)) {
+					name = `${stripExt(it.name)}-optimized (${n}).${ext}`;
 
-				while (usedNames.has(filename)) {
-					filename = `${baseName}-optimized (${counter}).${ext}`;
-
-					counter++;
+					n++;
 				}
 
-				usedNames.add(filename);
+				used.add(name);
 
-				const arrayBuffer = await it.processed.blob.arrayBuffer();
-
-				const data = new Uint8Array(arrayBuffer);
-
-				if (!data.length) {
-					console.warn(`Skipping empty file: ${filename}`);
-
-					continue;
-				}
+				const buf = await it.processed.blob.arrayBuffer();
 
 				entries.push({
-					name: filename,
-					data,
+					name,
+					data: new Uint8Array(buf),
 				});
 
 				await yieldToBrowser();
 			}
 
-			if (!entries.length) {
-				throw new Error(
-					"No valid processed images were available for the ZIP.",
-				);
-			}
-
-			console.log(
-				"[ZIP] Creating archive:",
-				entries.map((entry) => ({
-					name: entry.name,
-					size: entry.data.length,
-				})),
-			);
-
 			const zipBytes = buildZip(entries);
 
-			console.log("[ZIP] Archive created:", formatBytes(zipBytes.length));
-
-			/*
-			 * Verify ZIP signature before downloading.
-			 *
-			 * ZIP files must start with:
-			 *
-			 * 50 4B 03 04
-			 */
-			if (
-				zipBytes.length < 22 ||
-				zipBytes[0] !== 0x50 ||
-				zipBytes[1] !== 0x4b ||
-				zipBytes[2] !== 0x03 ||
-				zipBytes[3] !== 0x04
-			) {
-				throw new Error("Generated ZIP has an invalid signature.");
-			}
-
-			const zipBlob = new Blob([zipBytes.buffer], {
-				type: "application/zip",
-			});
-
-			downloadBlob(zipBlob, "optimized-images.zip");
-		} catch (error) {
-			console.error("[ZIP] Failed to create ZIP:", error);
-
-			alert(error?.message || "Unable to create ZIP archive.");
-		}
-	})();
-}, [items]);
+			downloadBlob(
+				new Blob([zipBytes], {
+					type: "application/zip",
+				}),
+				"optimized-images.zip",
+			);
+		})();
+	}, [items]);
 
 	/* ------------------------------------------------------------------ */
 	/* STATS                                                               */
@@ -1528,7 +1450,9 @@ const handleDownload = useCallback(() => {
 				onDrop={handleDrop}
 				style={{
 					border: `1.5px dashed ${isDragging ? colors.accent : colors.border}`,
+
 					background: isDragging ? colors.accentDim + "33" : colors.panel,
+
 					borderRadius: 12,
 				}}
 				className="p-8 flex flex-col items-center justify-center text-center transition-colors">
@@ -1593,6 +1517,7 @@ const handleDownload = useCallback(() => {
 						onKeyDown={(e) => {
 							if (e.key === "Enter" && urlInput.trim()) {
 								addUrl(urlInput);
+
 								setUrlInput("");
 							}
 						}}
@@ -1610,6 +1535,7 @@ const handleDownload = useCallback(() => {
 						onClick={() => {
 							if (urlInput.trim()) {
 								addUrl(urlInput);
+
 								setUrlInput("");
 							}
 						}}
@@ -1832,7 +1758,9 @@ const handleDownload = useCallback(() => {
 						style={{
 							color: colors.textDim,
 						}}>
-						AI Processing may take several seconds per image. Works best on images with a clear subject and background.
+						AI background removal automatically limits inference resolution to
+						reduce browser memory usage. GPU acceleration is used when
+						available, with an automatic smaller-model fallback.
 					</p>
 				)}
 
@@ -1842,8 +1770,8 @@ const handleDownload = useCallback(() => {
 						style={{
 							color: colors.textDim,
 						}}>
-						Applies subtle clarity, contrast and sharpening while keeping normal
-						image output close to the 1 MB target.
+						Applies subtle clarity, contrast and sharpening while keeping the
+						output compressed to approximately 1 MB or less.
 					</p>
 				)}
 
