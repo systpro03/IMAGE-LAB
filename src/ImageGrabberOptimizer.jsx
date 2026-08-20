@@ -301,8 +301,22 @@ const MIN_JPEG_QUALITY = 0.45;
  * README section below for that path).
  */
 
+/*
+ * WebGPU detection (navigator.gpu existing) is not a reliable
+ * signal that the WebGPU backend will actually work — it can still
+ * fail at session-creation time depending on browser/OS/GPU driver,
+ * which is what produced:
+ *   "no available backend found. ERR: [webgpu] [object ErrorEvent]"
+ * on Vercel even though it worked locally. Rather than keep
+ * chasing environment-specific GPU failures, we always use the CPU
+ * model (isnet_quint8). It's slower per image but removes this
+ * entire class of crash. Flip FORCE_CPU to false if you want to
+ * re-attempt GPU support later.
+ */
+const FORCE_CPU = true;
+
 function supportsWebGPU() {
-	return typeof navigator !== "undefined" && !!navigator.gpu;
+	return !FORCE_CPU && typeof navigator !== "undefined" && !!navigator.gpu;
 }
 
 function baseAIConfig(device) {
@@ -1593,6 +1607,18 @@ export default function ImageGrabberOptimizer() {
 					</label>
 				</div>
 
+				{removeBg && (
+					<p
+						className="text-xs mt-2"
+						style={{
+							color: colors.textDim,
+						}}>
+						AI background removal automatically limits inference resolution to
+						reduce browser memory usage. GPU acceleration is used when
+						available, with an automatic smaller-model fallback for subsequent
+						images if the GPU model fails.
+					</p>
+				)}
 
 				{enhance && (
 					<p
