@@ -1665,9 +1665,7 @@ export default function ImageGrabberOptimizer() {
 						style={{
 							color: colors.textDim,
 						}}>
-						AI segmentation uses the higher-quality isnet_fp16 model at up to
-						2048px inference resolution. WebGPU is used when available, with
-						CPU/WASM fallback.
+						AI Processing may take several seconds per image. Works best on images with a clear subject and background.
 					</p>
 				)}
 
