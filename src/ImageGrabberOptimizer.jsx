@@ -1593,18 +1593,6 @@ export default function ImageGrabberOptimizer() {
 					</label>
 				</div>
 
-				{removeBg && (
-					<p
-						className="text-xs mt-2"
-						style={{
-							color: colors.textDim,
-						}}>
-						AI background removal automatically limits inference resolution to
-						reduce browser memory usage. GPU acceleration is used when
-						available, with an automatic smaller-model fallback for subsequent
-						images if the GPU model fails.
-					</p>
-				)}
 
 				{enhance && (
 					<p
