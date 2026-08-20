@@ -1,19 +1,5 @@
 import React, { useState, useRef, useCallback, useEffect } from "react";
-
-import {
-	Link2,
-	Upload,
-	X,
-	Download,
-	Wand2,
-	Scissors,
-	Loader2,
-	AlertCircle,
-	FolderOpen,
-	Trash2,
-	Sparkles,
-} from "lucide-react";
-
+import { Link2, Upload, X, Download, Wand2, Scissors, Loader2, AlertCircle, FolderOpen, Trash2, Sparkles } from "lucide-react";
 import { removeBackground as aiRemoveBackground } from "@imgly/background-removal";
 
 /* ---------------------------------------------------------------------- */
