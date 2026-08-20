@@ -75,147 +75,252 @@ const AI_FALLBACK_CONFIG = {
 /* ---------------------------------------------------------------------- */
 
 const CRC_TABLE = (() => {
-	const table = new Uint32Array(256);
+  const table = new Uint32Array(256);
 
-	for (let n = 0; n < 256; n++) {
-		let c = n;
+  for (let n = 0; n < 256; n++) {
+    let c = n;
 
-		for (let k = 0; k < 8; k++) {
-			c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-		}
+    for (let k = 0; k < 8; k++) {
+      c = (c & 1)
+        ? 0xedb88320 ^ (c >>> 1)
+        : c >>> 1;
+    }
 
-		table[n] = c >>> 0;
-	}
+    table[n] = c >>> 0;
+  }
 
-	return table;
+  return table;
 })();
 
 function crc32(bytes) {
-	let crc = 0xffffffff;
+  let crc = 0xffffffff;
 
-	for (let i = 0; i < bytes.length; i++) {
-		crc = CRC_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
-	}
+  for (let i = 0; i < bytes.length; i++) {
+    crc = CRC_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+  }
 
-	return (crc ^ 0xffffffff) >>> 0;
+  return (crc ^ 0xffffffff) >>> 0;
 }
 
-function dosDateTime(d) {
-	const date =
-		((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+function writeU16(value) {
+  const out = new Uint8Array(2);
+  const view = new DataView(out.buffer);
 
-	const time =
-		(d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
+  view.setUint16(0, value >>> 0, true);
 
-	return {
-		date,
-		time,
-	};
+  return out;
 }
 
-function u16(n) {
-	return new Uint8Array([n & 0xff, (n >> 8) & 0xff]);
-}
+function writeU32(value) {
+  const out = new Uint8Array(4);
+  const view = new DataView(out.buffer);
 
-function u32(n) {
-	return new Uint8Array([
-		n & 0xff,
-		(n >> 8) & 0xff,
-		(n >> 16) & 0xff,
-		(n >> 24) & 0xff,
-	]);
+  view.setUint32(0, value >>> 0, true);
+
+  return out;
 }
 
 function concatBytes(chunks) {
-	const total = chunks.reduce((s, c) => s + c.length, 0);
-	const out = new Uint8Array(total);
+  const total = chunks.reduce(
+    (sum, chunk) => sum + chunk.length,
+    0
+  );
 
-	let off = 0;
+  const result = new Uint8Array(total);
 
-	for (const c of chunks) {
-		out.set(c, off);
-		off += c.length;
-	}
+  let offset = 0;
 
-	return out;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.length;
+  }
+
+  return result;
 }
 
-function strBytes(s) {
-	return new TextEncoder().encode(s);
+function strBytes(str) {
+  return new TextEncoder().encode(str);
 }
 
+function dosDateTime(date) {
+  const year = Math.max(
+    1980,
+    Math.min(2107, date.getFullYear())
+  );
+
+  const dosDate =
+    ((year - 1980) << 9) |
+    ((date.getMonth() + 1) << 5) |
+    date.getDate();
+
+  const dosTime =
+    (date.getHours() << 11) |
+    (date.getMinutes() << 5) |
+    Math.floor(date.getSeconds() / 2);
+
+  return {
+    date: dosDate & 0xffff,
+    time: dosTime & 0xffff,
+  };
+}
+
+/**
+ * Creates a standards-compliant ZIP archive.
+ *
+ * Important:
+ * - Uses STORE compression (method 0)
+ * - Uses UTF-8 filename flag
+ * - Writes valid local file headers
+ * - Writes valid central directory headers
+ * - Writes valid EOCD record
+ * - Does not use data descriptors
+ * - Does not use ZIP64
+ */
 function buildZip(entries) {
-	const { date, time } = dosDateTime(new Date());
+  if (!Array.isArray(entries) || entries.length === 0) {
+    throw new Error("Cannot create an empty ZIP archive.");
+  }
 
-	const localChunks = [];
-	const centralChunks = [];
+  if (entries.length > 0xffff) {
+    throw new Error("Too many files for a standard ZIP archive.");
+  }
 
-	let offset = 0;
+  const now = new Date();
+  const { date, time } = dosDateTime(now);
 
-	for (const entry of entries) {
-		const nameBytes = strBytes(entry.name);
-		const data = entry.data;
+  const localParts = [];
+  const centralParts = [];
 
-		const crc = crc32(data);
-		const size = data.length;
+  let localOffset = 0;
 
-		const local = concatBytes([
-			u32(0x04034b50),
-			u16(20),
-			u16(0),
-			u16(0),
-			u16(time),
-			u16(date),
-			u32(crc),
-			u32(size),
-			u32(size),
-			u16(nameBytes.length),
-			u16(0),
-			nameBytes,
-			data,
-		]);
+  for (const entry of entries) {
+    if (!entry || typeof entry.name !== "string") {
+      throw new Error("Invalid ZIP entry name.");
+    }
 
-		localChunks.push(local);
+    if (!(entry.data instanceof Uint8Array)) {
+      throw new Error(`Invalid ZIP data for "${entry.name}".`);
+    }
 
-		const central = concatBytes([
-			u32(0x02014b50),
-			u16(20),
-			u16(20),
-			u16(0),
-			u16(time),
-			u16(date),
-			u32(crc),
-			u32(size),
-			u32(size),
-			u16(nameBytes.length),
-			u16(0),
-			u16(0),
-			u16(0),
-			u16(0),
-			u32(0),
-			u32(offset),
-			nameBytes,
-		]);
+    const nameBytes = strBytes(entry.name);
+    const data = entry.data;
 
-		centralChunks.push(central);
+    if (nameBytes.length > 0xffff) {
+      throw new Error(`ZIP filename is too long: ${entry.name}`);
+    }
 
-		offset += local.length;
-	}
+    if (data.length > 0xffffffff) {
+      throw new Error(`File is too large for standard ZIP: ${entry.name}`);
+    }
 
-	const centralDir = concatBytes(centralChunks);
+    if (localOffset > 0xffffffff) {
+      throw new Error("ZIP archive is too large for standard ZIP.");
+    }
 
-	const end = concatBytes([
-		u32(0x06054b50),
-		u16(0),
-		u16(0),
-		u16(entries.length),
-		u16(entries.length),
-		u32(centralDir.length),
-		u32(offset),
-		u16(0),
-	]);
+    const crc = crc32(data);
 
-	return concatBytes([...localChunks, centralDir, end]);
+    /*
+     * General purpose bit flag:
+     *
+     * Bit 11 = UTF-8 filename
+     */
+    const flags = 0x0800;
+
+    /*
+     * Compression method:
+     *
+     * 0 = STORE / no compression
+     */
+    const compressionMethod = 0;
+
+    /* --------------------------------------------------------------- */
+    /* LOCAL FILE HEADER                                                */
+    /* --------------------------------------------------------------- */
+
+    const localHeader = concatBytes([
+      writeU32(0x04034b50), // Local file header signature
+      writeU16(20),         // Version needed to extract
+      writeU16(flags),      // General purpose bit flag
+      writeU16(compressionMethod),
+      writeU16(time),
+      writeU16(date),
+      writeU32(crc),
+      writeU32(data.length),
+      writeU32(data.length),
+      writeU16(nameBytes.length),
+      writeU16(0),         // Extra field length
+      nameBytes,
+    ]);
+
+    localParts.push(localHeader);
+    localParts.push(data);
+
+    /* --------------------------------------------------------------- */
+    /* CENTRAL DIRECTORY HEADER                                         */
+    /* --------------------------------------------------------------- */
+
+    const centralHeader = concatBytes([
+      writeU32(0x02014b50), // Central directory signature
+
+      writeU16(20),         // Version made by
+      writeU16(20),         // Version needed to extract
+
+      writeU16(flags),
+      writeU16(compressionMethod),
+
+      writeU16(time),
+      writeU16(date),
+
+      writeU32(crc),
+
+      writeU32(data.length),
+      writeU32(data.length),
+
+      writeU16(nameBytes.length),
+      writeU16(0),          // Extra field length
+      writeU16(0),          // Comment length
+
+      writeU16(0),          // Disk number start
+      writeU16(0),          // Internal attributes
+      writeU32(0),          // External attributes
+
+      writeU32(localOffset),
+
+      nameBytes,
+    ]);
+
+    centralParts.push(centralHeader);
+
+    localOffset += localHeader.length + data.length;
+  }
+
+  const localDirectory = concatBytes(localParts);
+  const centralDirectory = concatBytes(centralParts);
+
+  /* --------------------------------------------------------------- */
+  /* END OF CENTRAL DIRECTORY                                         */
+  /* --------------------------------------------------------------- */
+
+  const endOfCentralDirectory = concatBytes([
+    writeU32(0x06054b50),
+
+    writeU16(0), // Disk number
+    writeU16(0), // Disk containing central directory
+
+    writeU16(entries.length),
+    writeU16(entries.length),
+
+    writeU32(centralDirectory.length),
+    writeU32(localDirectory.length),
+
+    writeU16(0), // ZIP comment length
+  ]);
+
+  return concatBytes([
+    localDirectory,
+    centralDirectory,
+    endOfCentralDirectory,
+  ]);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1181,64 +1286,126 @@ export default function ImageGrabberOptimizer() {
 	/* DOWNLOAD                                                            */
 	/* ------------------------------------------------------------------ */
 
-	const handleDownload = useCallback(() => {
-		const done = items.filter(
-			(it) => it.processStatus === "done" && it.processed,
-		);
+const handleDownload = useCallback(() => {
+	const done = items.filter(
+		(it) =>
+			it.processStatus === "done" &&
+			it.processed &&
+			it.processed.blob instanceof Blob &&
+			it.processed.blob.size > 0,
+	);
 
-		if (!done.length) {
-			return;
-		}
+	if (!done.length) {
+		return;
+	}
 
-		if (done.length === 1) {
-			const it = done[0];
+	/* --------------------------------------------------------------- */
+	/* SINGLE IMAGE                                                     */
+	/* --------------------------------------------------------------- */
 
-			const ext = it.processed.mime === "image/png" ? "png" : "jpg";
+	if (done.length === 1) {
+		const it = done[0];
 
-			downloadBlob(it.processed.blob, `${stripExt(it.name)}-optimized.${ext}`);
+		const ext = it.processed.mime === "image/png" ? "png" : "jpg";
 
-			return;
-		}
+		const filename = `${stripExt(it.name)}-optimized.${ext}`;
 
-		(async () => {
-			const used = new Set();
+		downloadBlob(it.processed.blob, filename);
+
+		return;
+	}
+
+	/* --------------------------------------------------------------- */
+	/* MULTIPLE IMAGES -> ZIP                                          */
+	/* --------------------------------------------------------------- */
+
+	(async () => {
+		try {
+			const usedNames = new Set();
 			const entries = [];
 
 			for (const it of done) {
 				const ext = it.processed.mime === "image/png" ? "png" : "jpg";
 
-				let name = `${stripExt(it.name)}-optimized.${ext}`;
+				const baseName = stripExt(it.name);
 
-				let n = 2;
+				let filename = `${baseName}-optimized.${ext}`;
 
-				while (used.has(name)) {
-					name = `${stripExt(it.name)}-optimized (${n}).${ext}`;
+				let counter = 2;
 
-					n++;
+				while (usedNames.has(filename)) {
+					filename = `${baseName}-optimized (${counter}).${ext}`;
+
+					counter++;
 				}
 
-				used.add(name);
+				usedNames.add(filename);
 
-				const buf = await it.processed.blob.arrayBuffer();
+				const arrayBuffer = await it.processed.blob.arrayBuffer();
+
+				const data = new Uint8Array(arrayBuffer);
+
+				if (!data.length) {
+					console.warn(`Skipping empty file: ${filename}`);
+
+					continue;
+				}
 
 				entries.push({
-					name,
-					data: new Uint8Array(buf),
+					name: filename,
+					data,
 				});
 
 				await yieldToBrowser();
 			}
 
+			if (!entries.length) {
+				throw new Error(
+					"No valid processed images were available for the ZIP.",
+				);
+			}
+
+			console.log(
+				"[ZIP] Creating archive:",
+				entries.map((entry) => ({
+					name: entry.name,
+					size: entry.data.length,
+				})),
+			);
+
 			const zipBytes = buildZip(entries);
 
-			downloadBlob(
-				new Blob([zipBytes], {
-					type: "application/zip",
-				}),
-				"optimized-images.zip",
-			);
-		})();
-	}, [items]);
+			console.log("[ZIP] Archive created:", formatBytes(zipBytes.length));
+
+			/*
+			 * Verify ZIP signature before downloading.
+			 *
+			 * ZIP files must start with:
+			 *
+			 * 50 4B 03 04
+			 */
+			if (
+				zipBytes.length < 22 ||
+				zipBytes[0] !== 0x50 ||
+				zipBytes[1] !== 0x4b ||
+				zipBytes[2] !== 0x03 ||
+				zipBytes[3] !== 0x04
+			) {
+				throw new Error("Generated ZIP has an invalid signature.");
+			}
+
+			const zipBlob = new Blob([zipBytes.buffer], {
+				type: "application/zip",
+			});
+
+			downloadBlob(zipBlob, "optimized-images.zip");
+		} catch (error) {
+			console.error("[ZIP] Failed to create ZIP:", error);
+
+			alert(error?.message || "Unable to create ZIP archive.");
+		}
+	})();
+}, [items]);
 
 	/* ------------------------------------------------------------------ */
 	/* STATS                                                               */
