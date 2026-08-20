@@ -231,10 +231,6 @@ function downloadBlob(blob, filename) {
 /* BROWSER YIELD                                                         */
 /* ---------------------------------------------------------------------- */
 
-/*
- * Allows the browser to repaint and respond to user interaction
- * between heavy operations.
- */
 function yieldToBrowser() {
 	return new Promise((resolve) => {
 		if (typeof requestIdleCallback === "function") {
@@ -251,117 +247,105 @@ function yieldToBrowser() {
 /* IMAGE LIMITS                                                           */
 /* ---------------------------------------------------------------------- */
 
-/*
- * Maximum dimensions used for normal image processing.
- */
 const MAX_WORK_DIM = 2500;
 
-/*
- * Maximum AI inference dimension.
- *
- * Sending a 5000px / 6000px / 8000px image directly to the
- * segmentation model can consume a huge amount of browser memory.
- */
 const AI_MAX_DIMENSION = 2048;
 
-/*
- * Final output target.
- */
 const MAX_OUTPUT_BYTES = 1024 * 1024;
 
-/*
- * Minimum JPEG quality.
- */
 const MIN_JPEG_QUALITY = 0.45;
 
 /* ---------------------------------------------------------------------- */
 /* AI BACKGROUND REMOVAL                                                  */
 /* ---------------------------------------------------------------------- */
 
-let backgroundRemovalReady = false;
+/*
+ * IMPORTANT — fixes "multiple calls to 'initWasm()' detected":
+ *
+ * onnxruntime-web (used internally by @imgly/background-removal)
+ * only allows ONE wasm-backend initialization per page lifetime.
+ * The old code tried aiRemoveBackground() with a "primary" config,
+ * and on failure immediately tried again with a "fallback" config.
+ * If the first call had already begun initializing the wasm
+ * runtime before it failed, that second call would throw the
+ * "multiple calls to initWasm()" error instead of actually
+ * falling back — which is exactly the failure you saw on Vercel.
+ *
+ * The fix: decide the config ONCE per session (cached below) and
+ * never call aiRemoveBackground() a second time as an in-flight
+ * retry. If it fails, we downgrade the *cached* session config to
+ * CPU for all *future* calls, but we don't retry the same image
+ * inline.
+ *
+ * We also set `publicPath` explicitly. Without it, the library has
+ * to guess where its wasm/model assets live relative to your
+ * bundle, which is a common cause of "no available backend found"
+ * on platforms like Vercel where asset paths differ from local dev.
+ * Pin this to the exact version you have installed in package.json.
+ */
 
 /*
- * We intentionally do NOT call preload().
+ * DO NOT hardcode publicPath to a generic CDN (e.g. unpkg). The
+ * library fetches a resources.json manifest from publicPath to look
+ * up each model file, and that manifest's layout must match the
+ * exact version of @imgly/background-removal-data you have
+ * installed. Guessing a CDN/version here caused
+ * "Resource /models/isnet_quint8 not found" both locally and on
+ * Vercel — see https://github.com/imgly/background-removal-js/issues/125
  *
- * The model will be loaded only when the first background-removal
- * operation actually starts.
+ * Leaving publicPath unset lets the library use its own default,
+ * which is built from the *actual installed* package version:
+ * https://staticimgly.com/@imgly/background-removal-data/${PACKAGE_VERSION}/dist/
+ * That always matches your node_modules, so don't override it
+ * unless you're deliberately self-hosting the assets (see note in
+ * README section below for that path).
  */
-let backgroundRemovalLoading = null;
-
-/*
- * Primary configuration.
- *
- * WebGPU is used when available.
- */
-const AI_PRIMARY_CONFIG = {
-	model: "isnet_fp16",
-
-	/*
-	 * Changed dynamically if WebGPU isn't supported.
-	 */
-	device: "gpu",
-
-	/*
-	 * Let the library use a worker where supported.
-	 */
-	proxyToWorker: true,
-
-	output: {
-		format: "image/png",
-		type: "foreground",
-		quality: 1,
-	},
-};
-
-/*
- * Smaller fallback model.
- *
- * This is important for browsers where fp16/WebGPU
- * produces the B.Gb null runtime error.
- */
-const AI_FALLBACK_CONFIG = {
-	model: "isnet_quint8",
-	device: "cpu",
-
-	proxyToWorker: true,
-
-	output: {
-		format: "image/png",
-		type: "foreground",
-		quality: 1,
-	},
-};
 
 function supportsWebGPU() {
 	return typeof navigator !== "undefined" && !!navigator.gpu;
 }
 
-function getAIConfig() {
-	if (supportsWebGPU()) {
-		return AI_PRIMARY_CONFIG;
-	}
-
+function baseAIConfig(device) {
 	return {
-		...AI_PRIMARY_CONFIG,
-		device: "cpu",
+		model: device === "gpu" ? "isnet_fp16" : "isnet_quint8",
+		device,
+		proxyToWorker: true,
+		output: {
+			format: "image/png",
+			type: "foreground",
+			quality: 1,
+		},
 	};
 }
 
 /*
- * No eager model preload.
+ * Session-level cache. Computed once, reused for every image.
+ * `forcedCPU` flips true the first time a GPU attempt fails, so
+ * later images skip straight to the CPU model instead of retrying
+ * the GPU path (which is what triggered the double-init crash).
  */
-async function prepareBackgroundRemoval() {
-	if (backgroundRemovalReady) {
+let sessionAIState = null;
+
+function getSessionAIConfig() {
+	if (!sessionAIState) {
+		sessionAIState = {
+			forcedCPU: !supportsWebGPU(),
+		};
+	}
+
+	return baseAIConfig(sessionAIState.forcedCPU ? "cpu" : "gpu");
+}
+
+function markAIForcedCPU() {
+	if (!sessionAIState) {
+		sessionAIState = {
+			forcedCPU: true,
+		};
+
 		return;
 	}
 
-	if (!backgroundRemovalLoading) {
-		backgroundRemovalLoading = Promise.resolve().then(() => {
-			backgroundRemovalReady = true;
-		});
-	}
-
-	await backgroundRemovalLoading;
+	sessionAIState.forcedCPU = true;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -383,9 +367,6 @@ async function prepareAIInput(src) {
 
 	const height = Math.max(1, Math.round(originalHeight * scale));
 
-	/*
-	 * Already small enough.
-	 */
 	if (width === originalWidth && height === originalHeight) {
 		return {
 			blob: null,
@@ -417,9 +398,6 @@ async function prepareAIInput(src) {
 
 	const blob = await canvasToBlob(canvas, "image/jpeg", 0.92);
 
-	/*
-	 * Release canvas backing memory.
-	 */
 	canvas.width = 1;
 	canvas.height = 1;
 
@@ -438,29 +416,29 @@ async function prepareAIInput(src) {
 /* REMOVE BACKGROUND                                                      */
 /* ---------------------------------------------------------------------- */
 
+/*
+ * Single attempt per call — no inline primary/fallback retry.
+ * The session-level config already reflects the best-known device
+ * (see getSessionAIConfig / markAIForcedCPU above), so by the time
+ * this runs for image N, it's already using whatever worked (or was
+ * forced) for image N-1.
+ */
 async function removeBackgroundAI(src) {
-	await prepareBackgroundRemoval();
-
 	const aiInput = await prepareAIInput(src);
 
 	try {
 		const input = aiInput.blob || src;
 
-		/*
-		 * ---------------------------------------------------------------
-		 * FIRST ATTEMPT
-		 * ---------------------------------------------------------------
-		 */
+		const config = getSessionAIConfig();
+
+		console.log("[BG] Starting AI background removal:", {
+			model: config.model,
+			device: config.device,
+			width: aiInput.width,
+			height: aiInput.height,
+		});
+
 		try {
-			const config = getAIConfig();
-
-			console.log("[BG] Starting AI background removal:", {
-				model: config.model,
-				device: config.device,
-				width: aiInput.width,
-				height: aiInput.height,
-			});
-
 			const result = await aiRemoveBackground(input, config);
 
 			if (!(result instanceof Blob)) {
@@ -468,37 +446,23 @@ async function removeBackgroundAI(src) {
 			}
 
 			return result;
-		} catch (primaryError) {
-			console.warn(
-				"[BG] Primary model failed. Using fallback model.",
-				primaryError,
-			);
+		} catch (err) {
+			// Don't retry inline — that's what causes the double
+			// initWasm() crash. Just downgrade the session to CPU
+			// so the *next* image (or a user-triggered retry) uses
+			// the safer path, and surface this failure for this image.
+			if (config.device === "gpu") {
+				console.warn(
+					"[BG] GPU model failed — future images will use the CPU model.",
+					err,
+				);
 
-			/*
-			 * -------------------------------------------------------------
-			 * FALLBACK
-			 * -------------------------------------------------------------
-			 *
-			 * Handles browser/WebGPU/FP16 failures such as:
-			 *
-			 * TypeError:
-			 * can't access property "hc", B.Gb is null
-			 */
-			const fallbackResult = await aiRemoveBackground(
-				input,
-				AI_FALLBACK_CONFIG,
-			);
-
-			if (!(fallbackResult instanceof Blob)) {
-				throw new Error("Background removal returned an invalid image.");
+				markAIForcedCPU();
 			}
 
-			return fallbackResult;
+			throw err;
 		}
 	} finally {
-		/*
-		 * Release temporary resized image.
-		 */
 		if (aiInput.temporary && aiInput.src) {
 			URL.revokeObjectURL(aiInput.src);
 		}
@@ -537,9 +501,6 @@ function drawEnhancedImage(
 		ctx.globalCompositeOperation = "source-over";
 	}
 
-	/*
-	 * Subtle enhancement.
-	 */
 	if (enhance) {
 		ctx.filter = "contrast(1.045) saturate(1.025) brightness(1.005)";
 	}
@@ -548,9 +509,6 @@ function drawEnhancedImage(
 
 	ctx.filter = "none";
 
-	/*
-	 * Mild sharpening only for normal images.
-	 */
 	if (enhance && !transparent) {
 		ctx.globalAlpha = 0.08;
 
@@ -605,9 +563,6 @@ async function encodeJpegUnderLimit(img, width, height, quality, enhance) {
 	let bestWidth = width;
 	let bestHeight = height;
 
-	/*
-	 * Maximum 7 encodes instead of 12.
-	 */
 	for (let attempt = 0; attempt < 7; attempt++) {
 		const canvas = drawEnhancedImage(img, currentWidth, currentHeight, {
 			enhance,
@@ -616,9 +571,6 @@ async function encodeJpegUnderLimit(img, width, height, quality, enhance) {
 
 		const blob = await canvasToBlob(canvas, "image/jpeg", currentQuality);
 
-		/*
-		 * Release canvas memory.
-		 */
 		canvas.width = 1;
 		canvas.height = 1;
 
@@ -639,18 +591,12 @@ async function encodeJpegUnderLimit(img, width, height, quality, enhance) {
 
 		await yieldToBrowser();
 
-		/*
-		 * Reduce quality first.
-		 */
 		if (currentQuality > MIN_JPEG_QUALITY) {
 			currentQuality = Math.max(MIN_JPEG_QUALITY, currentQuality - 0.1);
 
 			continue;
 		}
 
-		/*
-		 * Then reduce dimensions.
-		 */
 		currentWidth = Math.max(320, Math.round(currentWidth * 0.82));
 
 		currentHeight = Math.max(320, Math.round(currentHeight * 0.82));
@@ -678,9 +624,6 @@ async function encodePngUnderLimit(img, width, height, enhance) {
 	let bestWidth = width;
 	let bestHeight = height;
 
-	/*
-	 * Five attempts instead of 14.
-	 */
 	for (let attempt = 0; attempt < 5; attempt++) {
 		const canvas = drawEnhancedImage(img, currentWidth, currentHeight, {
 			enhance,
@@ -689,9 +632,6 @@ async function encodePngUnderLimit(img, width, height, enhance) {
 
 		const blob = await canvasToBlob(canvas, "image/png", 1);
 
-		/*
-		 * Release canvas memory.
-		 */
 		canvas.width = 1;
 		canvas.height = 1;
 
@@ -712,9 +652,6 @@ async function encodePngUnderLimit(img, width, height, enhance) {
 
 		await yieldToBrowser();
 
-		/*
-		 * Reduce dimensions.
-		 */
 		const scale = attempt === 0 ? 0.82 : 0.75;
 
 		currentWidth = Math.max(320, Math.round(currentWidth * scale));
@@ -759,14 +696,6 @@ async function processImage(item, settings) {
 
 	if (settings.removeBg) {
 		try {
-			/*
-			 * The function internally:
-			 *
-			 * 1. Resizes the input to max 2048px for AI
-			 * 2. Runs GPU/fp16 where possible
-			 * 3. Falls back to quint8 CPU if necessary
-			 * 4. Releases temporary memory
-			 */
 			const aiBlob = await removeBackgroundAI(item.workingSrc);
 
 			if (!(aiBlob instanceof Blob)) {
@@ -778,10 +707,6 @@ async function processImage(item, settings) {
 			try {
 				const transparentImg = await loadImageEl(aiUrl);
 
-				/*
-				 * If nothing else is enabled,
-				 * return the AI result directly.
-				 */
 				if (!settings.optimize && !settings.enhance) {
 					return {
 						blob: aiBlob,
@@ -791,9 +716,6 @@ async function processImage(item, settings) {
 					};
 				}
 
-				/*
-				 * Final output dimensions.
-				 */
 				let outputWidth = transparentImg.naturalWidth;
 
 				let outputHeight = transparentImg.naturalHeight;
@@ -811,9 +733,6 @@ async function processImage(item, settings) {
 					outputHeight = Math.max(1, Math.round(outputHeight * outputScale));
 				}
 
-				/*
-				 * Transparent image remains PNG.
-				 */
 				return await encodePngUnderLimit(
 					transparentImg,
 					outputWidth,
@@ -912,10 +831,6 @@ export default function ImageGrabberOptimizer() {
 
 	const fileInputRef = useRef(null);
 
-	/* ------------------------------------------------------------------ */
-	/* CLEANUP                                                             */
-	/* ------------------------------------------------------------------ */
-
 	useEffect(() => {
 		return () => {
 			items.forEach((it) => {
@@ -929,10 +844,6 @@ export default function ImageGrabberOptimizer() {
 			});
 		};
 	}, []);
-
-	/* ------------------------------------------------------------------ */
-	/* ADD FILES                                                           */
-	/* ------------------------------------------------------------------ */
 
 	const addFiles = useCallback((fileList) => {
 		const files = Array.from(fileList).filter((f) =>
@@ -965,10 +876,6 @@ export default function ImageGrabberOptimizer() {
 			}),
 		]);
 	}, []);
-
-	/* ------------------------------------------------------------------ */
-	/* ADD URL                                                             */
-	/* ------------------------------------------------------------------ */
 
 	const addUrl = useCallback(async (rawUrl) => {
 		const url = rawUrl.trim();
@@ -1040,9 +947,6 @@ export default function ImageGrabberOptimizer() {
 				),
 			);
 		} catch {
-			/*
-			 * Fall back to direct image loading.
-			 */
 			setItems((prev) =>
 				prev.map((it) =>
 					it.id === id
@@ -1058,10 +962,6 @@ export default function ImageGrabberOptimizer() {
 			);
 		}
 	}, []);
-
-	/* ------------------------------------------------------------------ */
-	/* REMOVE ITEM                                                         */
-	/* ------------------------------------------------------------------ */
 
 	const removeItem = useCallback(
 		(id) => {
@@ -1086,10 +986,6 @@ export default function ImageGrabberOptimizer() {
 		[processing],
 	);
 
-	/* ------------------------------------------------------------------ */
-	/* CLEAR ALL                                                           */
-	/* ------------------------------------------------------------------ */
-
 	const clearAll = useCallback(() => {
 		if (processing) {
 			return;
@@ -1107,10 +1003,6 @@ export default function ImageGrabberOptimizer() {
 
 		setItems([]);
 	}, [items, processing]);
-
-	/* ------------------------------------------------------------------ */
-	/* DROP                                                                */
-	/* ------------------------------------------------------------------ */
 
 	const handleDrop = useCallback(
 		(e) => {
@@ -1134,10 +1026,6 @@ export default function ImageGrabberOptimizer() {
 		},
 		[addFiles, addUrl],
 	);
-
-	/* ------------------------------------------------------------------ */
-	/* PROCESS - SEQUENTIAL QUEUE                                          */
-	/* ------------------------------------------------------------------ */
 
 	const handleProcess = useCallback(async () => {
 		if (!removeBg && !optimize && !enhance) {
@@ -1176,13 +1064,6 @@ export default function ImageGrabberOptimizer() {
 		);
 
 		try {
-			/*
-			 * IMPORTANT:
-			 *
-			 * ONE IMAGE AT A TIME.
-			 *
-			 * Do NOT use Promise.all().
-			 */
 			for (let index = 0; index < current.length; index++) {
 				const item = current[index];
 
@@ -1199,9 +1080,6 @@ export default function ImageGrabberOptimizer() {
 					),
 				);
 
-				/*
-				 * Allow React to render the processing state.
-				 */
 				await yieldToBrowser();
 
 				try {
@@ -1247,15 +1125,8 @@ export default function ImageGrabberOptimizer() {
 					);
 				}
 
-				/*
-				 * Give browser time to release memory
-				 * and repaint UI.
-				 */
 				await yieldToBrowser();
 
-				/*
-				 * Small gap between heavy jobs.
-				 */
 				await new Promise((resolve) => setTimeout(resolve, 50));
 			}
 		} finally {
@@ -1264,10 +1135,6 @@ export default function ImageGrabberOptimizer() {
 			await yieldToBrowser();
 		}
 	}, [items, processing, removeBg, optimize, enhance, quality, maxDimension]);
-
-	/* ------------------------------------------------------------------ */
-	/* DOWNLOAD                                                            */
-	/* ------------------------------------------------------------------ */
 
 	const handleDownload = useCallback(() => {
 		const done = items.filter(
@@ -1329,10 +1196,6 @@ export default function ImageGrabberOptimizer() {
 		})();
 	}, [items]);
 
-	/* ------------------------------------------------------------------ */
-	/* STATS                                                               */
-	/* ------------------------------------------------------------------ */
-
 	const doneItems = items.filter(
 		(it) => it.processStatus === "done" && it.processed,
 	);
@@ -1358,10 +1221,6 @@ export default function ImageGrabberOptimizer() {
 		(it) => it.processed.size > MAX_OUTPUT_BYTES,
 	).length;
 
-	/* ------------------------------------------------------------------ */
-	/* COLORS                                                              */
-	/* ------------------------------------------------------------------ */
-
 	const colors = {
 		bg: "#14181B",
 		panel: "#1B2023",
@@ -1374,10 +1233,6 @@ export default function ImageGrabberOptimizer() {
 		good: "#6FCF97",
 		bad: "#E8615A",
 	};
-
-	/* ------------------------------------------------------------------ */
-	/* UI                                                                  */
-	/* ------------------------------------------------------------------ */
 
 	return (
 		<div
@@ -1414,8 +1269,6 @@ export default function ImageGrabberOptimizer() {
         }
       `}</style>
 
-			{/* HEADER */}
-
 			<div className="mb-6">
 				<div
 					className="text-xs tracking-widest uppercase mb-1"
@@ -1438,8 +1291,6 @@ export default function ImageGrabberOptimizer() {
 					background and/or compress before downloading.
 				</p>
 			</div>
-
-			{/* INTAKE */}
 
 			<div
 				onDragOver={(e) => {
@@ -1549,8 +1400,6 @@ export default function ImageGrabberOptimizer() {
 					</button>
 				</div>
 			</div>
-
-			{/* LOADED IMAGES */}
 
 			{items.length > 0 && (
 				<div className="mt-6">
@@ -1702,8 +1551,6 @@ export default function ImageGrabberOptimizer() {
 				</div>
 			)}
 
-			{/* SETTINGS */}
-
 			<div
 				style={{
 					background: colors.panel,
@@ -1712,8 +1559,6 @@ export default function ImageGrabberOptimizer() {
 				}}
 				className="mt-6 p-4">
 				<div className="flex flex-wrap gap-5">
-					{/* REMOVE BG */}
-
 					<label className="flex items-center gap-2 text-sm cursor-pointer">
 						<input
 							type="checkbox"
@@ -1725,8 +1570,6 @@ export default function ImageGrabberOptimizer() {
 						Remove background
 					</label>
 
-					{/* OPTIMIZE */}
-
 					<label className="flex items-center gap-2 text-sm cursor-pointer">
 						<input
 							type="checkbox"
@@ -1737,8 +1580,6 @@ export default function ImageGrabberOptimizer() {
 						<Wand2 size={14} />
 						Optimize &amp; compress
 					</label>
-
-					{/* ENHANCE */}
 
 					<label className="flex items-center gap-2 text-sm cursor-pointer">
 						<input
@@ -1752,17 +1593,6 @@ export default function ImageGrabberOptimizer() {
 					</label>
 				</div>
 
-				{removeBg && (
-					<p
-						className="text-xs mt-2"
-						style={{
-							color: colors.textDim,
-						}}>
-						AI background removal automatically limits inference resolution to
-						reduce browser memory usage. GPU acceleration is used when
-						available, with an automatic smaller-model fallback.
-					</p>
-				)}
 
 				{enhance && (
 					<p
@@ -1776,8 +1606,6 @@ export default function ImageGrabberOptimizer() {
 				)}
 
 				<div className="grid sm:grid-cols-2 gap-4 mt-4">
-					{/* MAX DIMENSION */}
-
 					<div>
 						<div
 							className="flex justify-between text-xs mb-1"
@@ -1810,8 +1638,6 @@ export default function ImageGrabberOptimizer() {
 							<option value={2500}>2500px (original size if smaller)</option>
 						</select>
 					</div>
-
-					{/* JPEG QUALITY */}
 
 					<div>
 						<div
@@ -1847,8 +1673,6 @@ export default function ImageGrabberOptimizer() {
 					</div>
 				</div>
 
-				{/* SIZE TARGET */}
-
 				<div
 					className="mt-4 rounded-lg px-3 py-2 text-xs flex items-center gap-2"
 					style={{
@@ -1866,8 +1690,6 @@ export default function ImageGrabberOptimizer() {
 					per image
 				</div>
 			</div>
-
-			{/* ACTIONS */}
 
 			<div className="mt-6 flex flex-wrap items-center gap-3">
 				<button
@@ -1930,8 +1752,6 @@ export default function ImageGrabberOptimizer() {
 				)}
 			</div>
 
-			{/* ERROR */}
-
 			{errorItems.length > 0 && (
 				<p
 					className="text-xs mt-2"
@@ -1943,8 +1763,6 @@ export default function ImageGrabberOptimizer() {
 					in the download.
 				</p>
 			)}
-
-			{/* SAVINGS */}
 
 			{doneItems.length > 0 && (
 				<div
