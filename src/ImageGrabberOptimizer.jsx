@@ -1150,7 +1150,7 @@ export default function ImageGrabberOptimizer() {
 
 			const ext = it.processed.mime === "image/png" ? "png" : "jpg";
 
-			downloadBlob(it.processed.blob, `${stripExt(it.name)}-optimized.${ext}`);
+			downloadBlob(it.processed.blob, `${stripExt(it.name)}.${ext}`);
 
 			return;
 		}
@@ -1163,12 +1163,12 @@ export default function ImageGrabberOptimizer() {
 			for (const it of done) {
 				const ext = it.processed.mime === "image/png" ? "png" : "jpg";
 
-				let name = `${stripExt(it.name)}-optimized.${ext}`;
+				let name = `${stripExt(it.name)}.${ext}`;
 
 				let n = 2;
 
 				while (used.has(name)) {
-					name = `${stripExt(it.name)}-optimized (${n}).${ext}`;
+					name = `${stripExt(it.name)}(${n}).${ext}`;
 
 					n++;
 				}
